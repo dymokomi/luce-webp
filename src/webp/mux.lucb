@@ -1,0 +1,340 @@
+#==============================================================================================
+#
+#   webp/mux - The ICC profile, read as WebPMux reads a file
+#
+#   DESCRIPTION:
+#       Port of the reading half of mux/muxread.c and mux/muxinternal.c: WebPMuxCreate's
+#       walk over the chunks (images, with their ALPH chunk or ANMF frame, and the other
+#       chunks in their lists), MuxValidate's consistency checks between the VP8X flags
+#       and the chunks, and WebPMuxGetFeatures and WebPMuxGetChunk("ICCP"). A browser
+#       reads a WebP's color profile this way (Ladybird's WebPLoader), and a file the mux
+#       refuses is refused there, so `icc_profile` fails where WebPMuxCreate fails.
+#
+#==============================================================================================
+
+## The chunk kinds (WebPChunkId).
+enum ChunkKind:
+    vp8x
+    iccp
+    anim
+    anmf
+    alph
+    image
+    exif
+    xmp
+    unknown
+
+## ChunkGetIdFromTag.
+func chunk_kind(data: const u8[], at: usize) -> ChunkKind:
+    if holds(data, at, "VP8X"):
+        return ChunkKind.vp8x
+    if holds(data, at, "ICCP"):
+        return ChunkKind.iccp
+    if holds(data, at, "ANIM"):
+        return ChunkKind.anim
+    if holds(data, at, "ANMF"):
+        return ChunkKind.anmf
+    if holds(data, at, "ALPH"):
+        return ChunkKind.alph
+    if holds(data, at, "VP8 ") or holds(data, at, "VP8L"):
+        return ChunkKind.image
+    if holds(data, at, "EXIF"):
+        return ChunkKind.exif
+    if holds(data, at, "XMP "):
+        return ChunkKind.xmp
+    return ChunkKind.unknown
+
+## SizeWithPadding: a chunk's size on disk, header included.
+func size_with_padding(chunk_size: u64) -> u64:
+    return (u64)chunk_header_size + ((chunk_size + 1) & ~(u64)1)
+
+## A chunk: where its header is, and its payload's size.
+struct MuxChunk:
+    var at: usize
+    var size: usize
+
+    func payload(data: const u8[]) -> const u8[]:
+        return data[self.at + chunk_header_size..<self.at + chunk_header_size + self.size]
+
+## An image of the mux (WebPMuxImage): which of its chunks are there, and its size.
+struct MuxImage:
+    var has_header: bool
+    var alpha: MuxChunk?
+    var img: MuxChunk?
+    var width: usize
+    var height: usize
+    var has_alpha: bool
+    var is_partial: bool
+
+## What MuxValidate and the ICC profile need of a mux: the first image, the counts of the
+## images and of the other chunks, and the first VP8X and ICCP chunks.
+struct Mux:
+    var first: MuxImage
+    var image_count: usize
+    ## Images with an ANMF header, with an image chunk, with alpha, with an ALPH chunk.
+    var frame_count: usize
+    var with_image_count: usize
+    var any_alpha: bool
+    var alpha_chunks: usize
+    var vp8x: MuxChunk?
+    var vp8x_count: usize
+    var iccp: MuxChunk?
+    var iccp_count: usize
+    var anim_count: usize
+    var exif_count: usize
+    var xmp_count: usize
+    ## The canvas a VP8X chunk gives.
+    var canvas_width: usize
+    var canvas_height: usize
+
+    ## MuxImagePush.
+    func push(image: MuxImage):
+        if self.image_count == 0:
+            self.first = image
+        self.image_count += 1
+        if image.has_header:
+            self.frame_count += 1
+        if image.img != none:
+            self.with_image_count += 1
+        self.any_alpha = self.any_alpha or image.has_alpha
+        if image.alpha != none:
+            self.alpha_chunks += 1
+
+## ChunkVerifyAndAssign: the chunk at `at`, `size` bytes left, within `riff_size`; none
+## when it is invalid or runs past the data.
+func verify_chunk(data: const u8[], at: usize, size: usize, riff_size: u64) -> MuxChunk?:
+    if size < chunk_header_size:
+        return none
+    let chunk_size = (u64)le32(data, at + tag_size)
+    if chunk_size > max_chunk_payload:
+        return none
+    let chunk_disk_size = size_with_padding(chunk_size)
+    if chunk_disk_size > riff_size or chunk_disk_size > (u64)size:
+        return none
+    return MuxChunk(at = at, size = (usize)chunk_size)
+
+## MuxImageFinalize: the image's size and alpha from its bitstream header; false when the
+## header is not valid.
+func finalize_image(data: const u8[], image: MuxImage*) -> bool:
+    let img = image.img else return false
+    let bitstream = img.payload(data)
+    if holds(data, img.at, "VP8L"):
+        let header = vp8l_get_info(bitstream) else return false
+        # An ALPH chunk beside VP8L is ignored.
+        image.alpha = none
+        image.width = header.width
+        image.height = header.height
+        image.has_alpha = header.alpha
+        return true
+    let size = vp8_get_info(bitstream, bitstream.length) else return false
+    image.width = size.0
+    image.height = size.1
+    image.has_alpha = image.alpha != none
+    return true
+
+## MuxImageParse: an ANMF chunk's frame header and image chunks.
+func parse_frame_chunk(data: const u8[], chunk: MuxChunk, image: MuxImage*) -> bool:
+    var at = chunk.at + chunk_header_size
+    var size = chunk.size
+    let last = at + size
+    if size < anmf_chunk_size:
+        return false
+    image.has_header = true
+    # Waiting for ALPH and/or VP8/VP8L chunks.
+    image.is_partial = true
+    at += anmf_chunk_size
+    size -= anmf_chunk_size
+    while at != last:
+        let sub = verify_chunk(data, at, size, (u64)size) else return false
+        match chunk_kind(data, at):
+            .alph:
+                if image.alpha != none:
+                    return false
+                image.alpha = sub
+                image.is_partial = true
+            .image:
+                if image.img != none:
+                    return false
+                image.img = sub
+                if not finalize_image(data, image):
+                    return false
+                image.is_partial = false
+            .unknown:
+                # An unknown chunk before the image chunks.
+                if image.is_partial:
+                    return false
+            _:
+                return false
+        let disk_size = (usize)size_with_padding((u64)sub.size)
+        at += disk_size
+        size -= disk_size
+    return not image.is_partial
+
+## WebPMuxCreate: the mux of `data`, none where libwebp's mux refuses it.
+func mux_create(data: const u8[]) -> Mux?:
+    if data.length < riff_header_size + chunk_header_size:
+        return none
+    if not holds(data, 0, "RIFF") or not holds(data, chunk_header_size, "WEBP"):
+        return none
+    # The first chunk is VP8, VP8L or VP8X.
+    if not holds(data, riff_header_size, "VP8 ") and not holds(data, riff_header_size, "VP8L") and not holds(data, riff_header_size, "VP8X"):
+        return none
+    var riff_size = (u64)le32(data, tag_size)
+    if riff_size > max_chunk_payload:
+        return none
+    # This padding is historical (demux.c does not pad the file size).
+    riff_size = size_with_padding(riff_size)
+    if riff_size < (u64)riff_header_size or riff_size > (u64)data.length:
+        return none
+    let end = (usize)riff_size
+    var mux = Mux()
+    var image = MuxImage()
+    var at = riff_header_size
+    var size = end - riff_header_size
+    while at != end:
+        let chunk = verify_chunk(data, at, size, riff_size) else return none
+        let data_size = (usize)size_with_padding((u64)chunk.size)
+        match chunk_kind(data, at):
+            .alph:
+                # Consecutive ALPH chunks.
+                if image.alpha != none:
+                    return none
+                image.alpha = chunk
+                image.is_partial = true
+            .image:
+                image.img = chunk
+                if not finalize_image(data, &image):
+                    return none
+                image.is_partial = false
+                mux.push(image)
+                image = MuxImage()
+            .anmf:
+                # The image before is still incomplete.
+                if image.is_partial:
+                    return none
+                if not parse_frame_chunk(data, chunk, &image):
+                    return none
+                mux.push(image)
+                image = MuxImage()
+            .vp8x:
+                if image.is_partial:
+                    return none
+                if mux.vp8x_count == 0:
+                    mux.vp8x = chunk
+                mux.vp8x_count += 1
+                # The global canvas.
+                if data_size < chunk_header_size + vp8x_chunk_size:
+                    return none
+                mux.canvas_width = (usize)le24(data, at + 12) + 1
+                mux.canvas_height = (usize)le24(data, at + 15) + 1
+            .iccp:
+                if image.is_partial:
+                    return none
+                if mux.iccp_count == 0:
+                    mux.iccp = chunk
+                mux.iccp_count += 1
+            .anim:
+                if image.is_partial:
+                    return none
+                mux.anim_count += 1
+            .exif:
+                if image.is_partial:
+                    return none
+                mux.exif_count += 1
+            .xmp:
+                if image.is_partial:
+                    return none
+                mux.xmp_count += 1
+            .unknown:
+                if image.is_partial:
+                    return none
+        at += data_size
+        size -= data_size
+    # An incomplete image.
+    if image.is_partial:
+        return none
+    if not mux_validate(data, &mux):
+        return none
+    return mux
+
+## MuxGetCanvasInfo: the VP8X flags (or, without VP8X, the alpha of the first image); none
+## where the canvas is invalid.
+func mux_flags(data: const u8[], mux: const Mux*) -> u32?:
+    var width: u64 = 0
+    var height: u64 = 0
+    var flags: u32 = 0
+    if let vp8x = mux.vp8x:
+        if vp8x.size < vp8x_chunk_size:
+            return none
+        let payload = vp8x.at + chunk_header_size
+        flags = le32(data, payload)
+        width = (u64)le24(data, payload + 4) + 1
+        height = (u64)le24(data, payload + 7) + 1
+    else:
+        width = (u64)mux.canvas_width
+        height = (u64)mux.canvas_height
+        if width == 0 and height == 0 and mux.with_image_count == 1 and mux.frame_count == 0:
+            # One image and no forced canvas: the image's size.
+            width = (u64)mux.first.width
+            height = (u64)mux.first.height
+        if mux.image_count > 0 and mux.first.has_alpha:
+            flags |= alpha_flag
+    if width * height >= max_image_area:
+        return none
+    return flags
+
+## IsNotCompatible: a flag set without its chunks, or chunks without their flag.
+func not_compatible(flag: u32, count: usize) -> bool:
+    return (flag != 0) != (count > 0)
+
+## MuxValidate.
+func mux_validate(data: const u8[], mux: const Mux*) -> bool:
+    if mux.image_count == 0:
+        return false
+    let flags = mux_flags(data, mux) else return false
+    # At most one ICCP, EXIF and XMP chunk, each with its flag.
+    if mux.iccp_count > 1 or not_compatible(flags & iccp_flag, mux.iccp_count):
+        return false
+    if mux.exif_count > 1 or not_compatible(flags & exif_flag, mux.exif_count):
+        return false
+    if mux.xmp_count > 1 or not_compatible(flags & xmp_flag, mux.xmp_count):
+        return false
+    # The animation flag, the ANIM chunk and the ANMF chunks agree.
+    if mux.anim_count > 1:
+        return false
+    let num_frames = mux.frame_count
+    let has_animation = (flags & animation_flag) != 0
+    if has_animation and (mux.anim_count == 0 or num_frames == 0):
+        return false
+    if not has_animation and (mux.anim_count == 1 or num_frames > 0):
+        return false
+    if not has_animation:
+        # One image, of the canvas's size.
+        if mux.image_count != 1:
+            return false
+        if mux.canvas_width > 0 and (mux.first.width != mux.canvas_width or mux.first.height != mux.canvas_height):
+            return false
+    # A VP8X chunk, or a single image.
+    if mux.vp8x_count > 1:
+        return false
+    if mux.vp8x_count == 0 and mux.with_image_count != 1:
+        return false
+    # The alpha flag and the ALPH chunks agree (the flag may be set without alpha).
+    if mux.any_alpha:
+        if mux.vp8x_count > 0:
+            if (flags & alpha_flag) == 0:
+                return false
+        elif mux.alpha_chunks > 0:
+            return false
+    return true
+
+## The ICC profile of the WebP in `data`: the ICCP chunk's payload when the VP8X flags
+## announce one, none without; fails where WebPMuxCreate or WebPMuxGetFeatures refuses the
+## file, as Ladybird's decoder then refuses the image.
+pub func icc_profile(data: const u8[]) -> const u8[]?!:
+    let mux = mux_create(data) else error(corrupt, "WebP chunks are inconsistent")
+    let flags = mux_flags(data, &mux) else error(corrupt, "WebP canvas is invalid")
+    if (flags & iccp_flag) == 0:
+        return none
+    let iccp = mux.iccp else error(corrupt, "WebP has no ICCP chunk")
+    return iccp.payload(data)

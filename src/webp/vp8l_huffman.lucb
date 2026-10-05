@@ -1,0 +1,397 @@
+#==============================================================================================
+#
+#   webp/vp8l_huffman - Huffman tables and groups
+#
+#   DESCRIPTION:
+#       Port of utils/huffman_utils.c (BuildHuffmanTable: two-level lookup tables, eight
+#       bits at the root) and of the code reading of dec/vp8l_dec.c (ReadHuffmanCode,
+#       ReadHuffmanCodeLengths, ReadHuffmanCodesHelper, BuildPackedTable, ReadSymbol).
+#       A group holds five codes: green with the length prefixes and the color cache,
+#       red, blue, alpha, and the distance prefixes. A group whose red, blue and alpha
+#       codes have one symbol each is a trivial literal; one whose green code has a single
+#       literal too is a trivial code, decoded without reading a bit; one whose literal
+#       codes are short together gets a packed table that reads a whole pixel at once.
+#
+#       libwebp keeps its tables in chained segments; here they are one array, grown when
+#       a group's tables would not fit, the groups holding offsets into it.
+#
+#==============================================================================================
+
+## Root table bits for the five codes and for the code length code (HUFFMAN_TABLE_BITS,
+## LENGTHS_TABLE_BITS).
+let huffman_table_bits: u32 = 8
+let huffman_table_mask: u32 = 0xff
+let lengths_table_bits: u32 = 7
+let lengths_table_mask: u32 = 0x7f
+let max_allowed_code_length: usize = 15
+## The packed table's bits (HUFFMAN_PACKED_BITS) and the mark of an entry that is not a
+## literal (BITS_SPECIAL_MARKER).
+let huffman_packed_bits: u32 = 6
+let bits_special_marker: i32 = 0x100
+
+## The alphabets: 256 literals, 24 length prefixes, 40 distance prefixes.
+let num_literal_codes: u32 = 256
+let num_length_codes: u32 = 24
+let num_distance_codes: u32 = 40
+let huffman_codes_per_meta_code: usize = 5
+let max_cache_bits: u32 = 11
+## The codes of a group (HuffIndex).
+let huff_green: usize = 0
+let huff_red: usize = 1
+let huff_blue: usize = 2
+let huff_alpha: usize = 3
+let huff_dist: usize = 4
+let alphabet_sizes: u32[5] = [280, 256, 256, 256, 40]
+let literal_map: bool[5] = [false, true, true, true, false]
+
+## The code length code's order (kCodeLengthCodeOrder), and its repeat codes.
+let code_length_code_order: u8[19] = [17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+let num_code_length_codes: usize = 19
+let code_length_literals: u32 = 16
+let code_length_repeat_code: u32 = 16
+let code_length_extra_bits: u8[3] = [2, 3, 7]
+let code_length_repeat_offsets: u8[3] = [3, 3, 11]
+let default_code_length: i32 = 8
+
+## The table entries a group's codes need at most, by color cache bits (kTableSize).
+let table_sizes: u16[12] = [2954, 2956, 2958, 2962, 2970, 2986, 3018, 3082, 3212, 3468, 3980, 5004]
+
+# mark: Tables ================================================================================
+
+## A lookup table entry: the bits of the symbol, or of the second level's table; the
+## symbol, or the offset of the second level's table (HuffmanCode).
+struct HuffmanCode:
+    var bits: u8
+    var value: u16
+
+## A packed table entry: a whole literal pixel and its bits, or a non-literal symbol with
+## its bits plus the special marker (HuffmanCode32).
+struct HuffmanCode32:
+    var bits: i32
+    var value: u32
+
+## The tables of every group, in one array.
+struct HuffmanTables:
+    var codes: HuffmanCode[]
+    var used: usize
+
+    func release():
+        if self.codes.length > 0:
+            free(self.codes) in memory.heap
+        var empty: HuffmanCode[]
+        self.codes = empty
+        self.used = 0
+
+## A group's five codes (HTreeGroup).
+struct TreeGroup:
+    ## Each code's table, as an offset into the tables.
+    var htrees: usize[5]
+    var is_trivial_literal: bool
+    ## The red, blue and alpha of a trivial literal, green zero.
+    var literal_arb: u32
+    var is_trivial_code: bool
+    var use_packed_table: bool
+    var packed_table: HuffmanCode32[64]
+
+## GetNextKey: reverse(reverse(key, len) + 1, len).
+inline func get_next_key(key: u32, len: usize) -> u32:
+    var step = (u32)1 << (u32)(len - 1)
+    while (key & step) != 0:
+        step >>= 1
+    return (key & (step - 1)) + step if step != 0 else key
+
+## ReplicateValue: `code` into table[0], table[step], ..., below `end`.
+inline func replicate_value(table: HuffmanCode*, step: usize, end: usize, code: HuffmanCode):
+    var at = end
+    while true:
+        at -= step
+        table[at] = code
+        if at == 0:
+            return
+
+## NextTableBitSize: the width of the next second-level table.
+func next_table_bit_size(count: const i32*, len: usize, root_bits: usize) -> usize:
+    var length = len
+    var left = (i32)1 << (u32)(length - root_bits)
+    while length < max_allowed_code_length:
+        left -= count[length]
+        if left <= 0:
+            break
+        length += 1
+        left <<= 1
+    return length - root_bits
+
+## BuildHuffmanTable: the table of `code_lengths` at `root_table` (or, without one, only
+## its size), the symbols sorted by length into `sorted`. Returns its size, 0 when the
+## lengths are not a valid code.
+func build_huffman_table(root_table: HuffmanCode*?, root_bits: usize, code_lengths: const i32[], sorted: u16*?) -> usize:
+    let code_lengths_size = code_lengths.length
+    var total_size = (usize)1 << (u32)root_bits
+    var count: i32[16]
+    var offset: i32[16]
+    # The histogram of code lengths.
+    for symbol in 0..<code_lengths_size:
+        if code_lengths[symbol] > (i32)max_allowed_code_length:
+            return 0
+        count[(usize)code_lengths[symbol]] += 1
+    # All code lengths zero.
+    if (usize)count[0] == code_lengths_size:
+        return 0
+    # The offsets of each length in the sorted symbols.
+    offset[1] = 0
+    for len in 1..<max_allowed_code_length:
+        if count[len] > (i32)1 << (u32)len:
+            return 0
+        offset[len + 1] = offset[len] + count[len]
+    # The symbols sorted by length, by symbol within a length.
+    for symbol in 0..<code_lengths_size:
+        let symbol_code_length = (usize)code_lengths[symbol]
+        if symbol_code_length > 0:
+            if let into = sorted:
+                if (usize)offset[symbol_code_length] >= code_lengths_size:
+                    return 0
+                into[(usize)offset[symbol_code_length]] = (u16)symbol
+            offset[symbol_code_length] += 1
+    # A code of one symbol.
+    if offset[max_allowed_code_length] == 1:
+        if let table = root_table:
+            let into = sorted else trap("a table is built with its sorted symbols")
+            replicate_value(table, 1, total_size, HuffmanCode(bits = 0, value = into[0]))
+        return total_size
+    var low: u32 = 0xffffffff
+    let mask = (u32)total_size - 1
+    var key: u32 = 0
+    var num_nodes: i32 = 1
+    var num_open: i32 = 1
+    var table_bits = root_bits
+    var table_size = (usize)1 << (u32)table_bits
+    var symbol: usize = 0
+    var table_at: usize = 0
+    # The root table.
+    var step: usize = 2
+    for len in 1..<root_bits + 1:
+        num_open <<= 1
+        num_nodes += num_open
+        num_open -= count[len]
+        if num_open < 0:
+            return 0
+        if let table = root_table:
+            let into = sorted else trap("a table is built with its sorted symbols")
+            while count[len] > 0:
+                replicate_value(table + (usize)key, step, table_size, HuffmanCode(bits = (u8)len, value = into[symbol]))
+                symbol += 1
+                key = get_next_key(key, len)
+                count[len] -= 1
+        step <<= 1
+    # The second level tables, and their entries in the root table.
+    step = 2
+    for len in root_bits + 1..<max_allowed_code_length + 1:
+        num_open <<= 1
+        num_nodes += num_open
+        num_open -= count[len]
+        if num_open < 0:
+            return 0
+        while count[len] > 0:
+            if (key & mask) != low:
+                table_at += table_size
+                table_bits = next_table_bit_size(&count[0], len, root_bits)
+                table_size = (usize)1 << (u32)table_bits
+                total_size += table_size
+                low = key & mask
+                if let table = root_table:
+                    table[(usize)low] = HuffmanCode(bits = (u8)(table_bits + root_bits), value = (u16)(table_at - (usize)low))
+            if let table = root_table:
+                let into = sorted else trap("a table is built with its sorted symbols")
+                replicate_value(table + table_at + (usize)(key >> (u32)root_bits), step, table_size, HuffmanCode(bits = (u8)(len - root_bits), value = into[symbol]))
+                symbol += 1
+            key = get_next_key(key, len)
+            count[len] -= 1
+        step <<= 1
+    # The tree must be full.
+    if num_nodes != 2 * offset[max_allowed_code_length] - 1:
+        return 0
+    return total_size
+
+## VP8LBuildHuffmanTable: the table of `code_lengths` at the end of `tables` (grown when
+## it does not fit), or its size alone without `tables`. 0 when the code is invalid.
+func add_huffman_table(tables: HuffmanTables*?, root_bits: usize, code_lengths: const i32[]) -> usize!:
+    let total_size = build_huffman_table(none, root_bits, code_lengths, none)
+    let into = tables else return total_size
+    if total_size == 0:
+        return 0
+    if into.used + total_size > into.codes.length:
+        let larger = try new HuffmanCode[into.used + total_size + into.codes.length] in memory.heap
+        memory.copy(larger, into.codes, into.used)
+        into.release()
+        into.codes = larger
+    let sorted = try new u16[code_lengths.length] --- in memory.heap
+    defer free(sorted) in memory.heap
+    _ = build_huffman_table(into.codes.data + into.used, root_bits, code_lengths, sorted.data)
+    return total_size
+
+# mark: Reading codes =========================================================================
+
+## ReadSymbol: the next symbol of the code at `table`. The bit window must hold enough bits.
+inline func read_symbol(table: const HuffmanCode*, br: LosslessBits*) -> u32:
+    var val = br.prefetch_bits()
+    var entry = table + (usize)(val & huffman_table_mask)
+    let nbits = (u32)entry[0].bits
+    if nbits > huffman_table_bits:
+        br.bit_pos = br.bit_pos +% huffman_table_bits
+        val = br.prefetch_bits()
+        entry = entry + (usize)entry[0].value
+        entry = entry + (usize)(val & ((((u32)1 << ((nbits -% huffman_table_bits) & 31)) -% 1)))
+    br.bit_pos = br.bit_pos +% (u32)entry[0].bits
+    return (u32)entry[0].value
+
+## ReadHuffmanCodeLengths: the code lengths of `code_lengths.length` symbols, coded with
+## the code length code.
+func read_huffman_code_lengths(br: LosslessBits*, code_length_code_lengths: const i32[], code_lengths: i32[]) -> !:
+    let num_symbols = code_lengths.length
+    var table: HuffmanCode[128]
+    var sorted: u16[19]
+    if build_huffman_table(&table[0], (usize)lengths_table_bits, code_length_code_lengths, &sorted[0]) == 0:
+        error(corrupt, "VP8L code length code is invalid")
+    var max_symbol = num_symbols
+    if br.read_bits(1) != 0:
+        # The number of symbols coded.
+        let length_nbits = 2 + 2 * br.read_bits(3)
+        max_symbol = 2 + (usize)br.read_bits(length_nbits)
+        if max_symbol > num_symbols:
+            error(corrupt, "VP8L code lengths are too many")
+    var symbol: usize = 0
+    var prev_code_len = default_code_length
+    while symbol < num_symbols:
+        if max_symbol == 0:
+            break
+        max_symbol -= 1
+        br.fill_bit_window()
+        let p = table[(usize)(br.prefetch_bits() & lengths_table_mask)]
+        br.bit_pos += (u32)p.bits
+        let code_len = (u32)p.value
+        if code_len < code_length_literals:
+            code_lengths[symbol] = (i32)code_len
+            symbol += 1
+            if code_len != 0:
+                prev_code_len = (i32)code_len
+        else:
+            let use_prev = code_len == code_length_repeat_code
+            let slot = (usize)(code_len - code_length_literals)
+            let extra_bits = (u32)code_length_extra_bits[slot]
+            let repeat_offset = (usize)code_length_repeat_offsets[slot]
+            let repeat = (usize)br.read_bits(extra_bits) + repeat_offset
+            if symbol + repeat > num_symbols:
+                error(corrupt, "VP8L code length repeat runs past the alphabet")
+            let length = prev_code_len if use_prev else 0
+            for i in 0..<repeat:
+                code_lengths[symbol + i] = length
+            symbol += repeat
+
+## ReadHuffmanCode: one code of `alphabet_size` symbols into `tables` (or only checked,
+## without), its lengths left in `code_lengths`. Returns the table's size.
+func read_huffman_code(br: LosslessBits*, alphabet_size: usize, code_lengths: i32[], tables: HuffmanTables*?) -> usize!:
+    let lengths = code_lengths[..<alphabet_size]
+    memory.set(u8[]((u8*)lengths.data, alphabet_size * 4), 0)
+    if br.read_bits(1) != 0:
+        # A simple code: one or two symbols, given directly, of length 1. A symbol past the
+        # alphabet lands in the rest of the buffer, outside the code, as in libwebp.
+        let num_symbols = br.read_bits(1) + 1
+        let first_symbol_len_code = br.read_bits(1)
+        # The first symbol has 1 or 8 bits, the second 8.
+        let first = br.read_bits(1 if first_symbol_len_code == 0 else 8)
+        code_lengths[(usize)first] = 1
+        if num_symbols == 2:
+            code_lengths[(usize)br.read_bits(8)] = 1
+    else:
+        # Code lengths, Huffman-coded.
+        var code_length_code_lengths: i32[19]
+        let num_codes = (usize)br.read_bits(4) + 4
+        for i in 0..<num_codes:
+            code_length_code_lengths[(usize)code_length_code_order[i]] = (i32)br.read_bits(3)
+        try read_huffman_code_lengths(br, code_length_code_lengths, lengths)
+    if br.eos:
+        error(corrupt, "VP8L data ends in a Huffman code")
+    let size = try add_huffman_table(tables, (usize)huffman_table_bits, lengths)
+    if size == 0:
+        error(corrupt, "VP8L Huffman code is invalid")
+    return size
+
+## AccumulateHCode: one code's entry added to a packed entry, its bits used.
+inline func accumulate_hcode(hcode: HuffmanCode, shift: u32, huff: HuffmanCode32*) -> u32:
+    huff.bits += (i32)hcode.bits
+    huff.value |= (u32)hcode.value << shift
+    return (u32)hcode.bits
+
+## BuildPackedTable: every six-bit prefix to a whole literal pixel, or to a non-literal
+## green symbol.
+func build_packed_table(group: TreeGroup*, codes: const HuffmanCode*):
+    for code in 0..<(u32)64:
+        var bits = code
+        let huff = &group.packed_table[(usize)code]
+        let hcode = codes[group.htrees[huff_green] + (usize)bits]
+        if (u32)hcode.value >= num_literal_codes:
+            huff.bits = (i32)hcode.bits + bits_special_marker
+            huff.value = (u32)hcode.value
+        else:
+            huff.bits = 0
+            huff.value = 0
+            bits >>= accumulate_hcode(hcode, 8, huff)
+            bits >>= accumulate_hcode(codes[group.htrees[huff_red] + (usize)bits], 16, huff)
+            bits >>= accumulate_hcode(codes[group.htrees[huff_blue] + (usize)bits], 0, huff)
+            bits >>= accumulate_hcode(codes[group.htrees[huff_alpha] + (usize)bits], 24, huff)
+
+## ReadHuffmanCodesHelper: the groups' codes. With a `mapping`, `num_htree_groups_max`
+## groups are read and those the Huffman image does not use (-1) only checked.
+func read_huffman_codes_helper(br: LosslessBits*, color_cache_bits: u32, num_htree_groups: usize, num_htree_groups_max: usize, mapping: const i32[], tables: HuffmanTables*, groups: TreeGroup[]) -> !:
+    let max_alphabet_size = (usize)alphabet_sizes[0] + ((usize)1 << color_cache_bits if color_cache_bits > 0 else 0)
+    let table_size = (usize)table_sizes[(usize)color_cache_bits]
+    if (mapping.length == 0 and num_htree_groups != num_htree_groups_max) or num_htree_groups > num_htree_groups_max:
+        error(corrupt, "VP8L Huffman groups are inconsistent")
+    let code_lengths = try new i32[max_alphabet_size] in memory.heap
+    defer free(code_lengths) in memory.heap
+    tables.codes = try new HuffmanCode[num_htree_groups * table_size] in memory.heap
+    for i in 0..<num_htree_groups_max:
+        if mapping.length > 0 and mapping[i] == -1:
+            # Unused by the Huffman image: checked, not kept.
+            for j in 0..<huffman_codes_per_meta_code:
+                var alphabet_size = (usize)alphabet_sizes[j]
+                if j == 0 and color_cache_bits > 0:
+                    alphabet_size += (usize)1 << color_cache_bits
+                _ = try read_huffman_code(br, alphabet_size, code_lengths, none)
+            continue
+        let group = &groups[i if mapping.length == 0 else (usize)mapping[i]]
+        var total_size: u32 = 0
+        var is_trivial_literal = true
+        var max_bits: i32 = 0
+        for j in 0..<huffman_codes_per_meta_code:
+            var alphabet_size = (usize)alphabet_sizes[j]
+            if j == 0 and color_cache_bits > 0:
+                alphabet_size += (usize)1 << color_cache_bits
+            let at = tables.used
+            let size = try read_huffman_code(br, alphabet_size, code_lengths, tables)
+            group.htrees[j] = at
+            let first = tables.codes[at]
+            if is_trivial_literal and literal_map[j]:
+                is_trivial_literal = first.bits == 0
+            total_size += (u32)first.bits
+            tables.used += size
+            if j <= huff_alpha:
+                var local_max_bits = code_lengths[0]
+                for k in 1..<alphabet_size:
+                    if code_lengths[k] > local_max_bits:
+                        local_max_bits = code_lengths[k]
+                max_bits += local_max_bits
+        group.is_trivial_literal = is_trivial_literal
+        group.is_trivial_code = false
+        if is_trivial_literal:
+            let red_value = (u32)tables.codes[group.htrees[huff_red]].value
+            let blue_value = (u32)tables.codes[group.htrees[huff_blue]].value
+            let alpha_value = (u32)tables.codes[group.htrees[huff_alpha]].value
+            group.literal_arb = (alpha_value << 24) | (red_value << 16) | blue_value
+            let green_value = (u32)tables.codes[group.htrees[huff_green]].value
+            if total_size == 0 and green_value < num_literal_codes:
+                group.is_trivial_code = true
+                group.literal_arb |= green_value << 8
+        group.use_packed_table = not group.is_trivial_code and max_bits < (i32)huffman_packed_bits
+        if group.use_packed_table:
+            build_packed_table(group, tables.codes.data)

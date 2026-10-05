@@ -1,0 +1,87 @@
+#==============================================================================================
+#
+#   tools/disk - Whole files in and out, for the tools
+#
+#   DESCRIPTION:
+#       The tools read the files they decode and write what they decoded through the C
+#       library's stdio: `read_file` and `write_file` (luce-gif's helper).
+#
+#==============================================================================================
+
+import c
+import memory
+
+extern func fopen(path: c.str, mode: c.str) -> void*?
+extern func fclose(file: void*) -> i32
+extern func fread(data: void*, size: usize, count: usize, file: void*) -> usize
+extern func fwrite(data: const void*, size: usize, count: usize, file: void*) -> usize
+
+# mark: Files =================================================================================
+
+## A growable byte buffer on the heap.
+pub struct Buffer:
+    var items: u8[]
+    pub var used: usize = 0
+
+    ## Append `data`.
+    pub func add_all(data: const u8[]) -> !:
+        if self.used + data.length > self.items.length:
+            var size = 256 if self.items.length == 0 else self.items.length * 2
+            while size < self.used + data.length:
+                size *= 2
+            let larger = try new u8[size] --- in memory.heap
+            memory.copy(larger, self.items, self.used)
+            if self.items.length > 0:
+                free(self.items) in memory.heap
+            self.items = larger
+        memory.copy(self.items[self.used..], data, data.length)
+        self.used += data.length
+
+    ## The bytes in use.
+    pub func view() -> u8[]:
+        return self.items[..<self.used]
+
+    ## Free the bytes; the buffer is empty afterwards.
+    pub func release():
+        if self.items.length > 0:
+            free(self.items) in memory.heap
+        var empty: u8[]
+        self.items = empty
+        self.used = 0
+
+## `path` with a NUL after it, in `name`, as C wants it.
+func c_path(path: str, name: Buffer*) -> c.str!:
+    try name.add_all(path.bytes)
+    var nul: u8[1]
+    try name.add_all(nul)
+    return (c.str)(str)name.view()
+
+## The bytes of the file at `path` on the heap, or none if it cannot be read.
+pub func read_file(path: str) -> u8[]?:
+    var name = Buffer()
+    defer name.release()
+    let text = c_path(path, &name) else return none
+    let file = fopen(text, "rb") else return none
+    defer _ = fclose(file)
+    var contents = Buffer()
+    defer contents.release()
+    var chunk: u8[65536]
+    while true:
+        let count = fread(&chunk[0], 1, 65536, file)
+        if count == 0:
+            break
+        contents.add_all(chunk[..<count]) catch failure:
+            _ = failure
+            return none
+    let exact = (new u8[contents.used] --- in memory.heap) else return none
+    memory.copy(exact, contents.items, contents.used)
+    return exact
+
+## Write `data` to the file at `path`.
+pub func write_file(path: str, data: const u8[]) -> !:
+    var name = Buffer()
+    defer name.release()
+    let file = fopen(try c_path(path, &name), "wb") else error(memory.exhausted, "cannot write a file")
+    if data.length > 0:
+        _ = fwrite(&data[0], 1, data.length, file)
+    _ = fclose(file)

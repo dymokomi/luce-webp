@@ -1,0 +1,385 @@
+#==============================================================================================
+#
+#   webp/vp8l_decode - The lossless image streams
+#
+#   DESCRIPTION:
+#       Port of dec/vp8l_dec.c, non-incremental. An image stream is its transforms (at
+#       the top level only), a color cache, its Huffman codes (with a meta Huffman image
+#       choosing the group of each tile, at the top level), then the pixels: literals,
+#       backward references (LZ77, distances through the 2D plane codes) and color cache
+#       hits. Sub-images (transform data, the Huffman image) are streams of their own.
+#       The top-level pixels are transformed back and handed on sixteen rows at a time:
+#       to RGBA, or for an ALPH chunk, their green as alpha (with a byte-per-pixel path
+#       for a palette-only alpha stream), unfiltered as they arrive.
+#
+#==============================================================================================
+
+## Rows transformed and handed on at a time (NUM_ARGB_CACHE_ROWS).
+let num_argb_cache_rows: usize = 16
+## The 120 short distance codes of the 2D plane: (yoffset << 4) | (8 - xoffset).
+let code_to_plane: u8[120] = [
+    0x18, 0x07, 0x17, 0x19, 0x28, 0x06, 0x27, 0x29, 0x16, 0x1a, 0x26, 0x2a, 0x38, 0x05, 0x37, 0x39, 0x15, 0x1b, 0x36, 0x3a, 0x25, 0x2b, 0x48, 0x04, 0x47, 0x49, 0x14, 0x1c, 0x35, 0x3b, 0x46, 0x4a, 0x24, 0x2c, 0x58, 0x45, 0x4b, 0x34, 0x3c, 0x03,
+    0x57, 0x59, 0x13, 0x1d, 0x56, 0x5a, 0x23, 0x2d, 0x44, 0x4c, 0x55, 0x5b, 0x33, 0x3d, 0x68, 0x02, 0x67, 0x69, 0x12, 0x1e, 0x66, 0x6a, 0x22, 0x2e, 0x54, 0x5c, 0x43, 0x4d, 0x65, 0x6b, 0x32, 0x3e, 0x78, 0x01, 0x77, 0x79, 0x53, 0x5d, 0x11, 0x1f,
+    0x64, 0x6c, 0x42, 0x4e, 0x76, 0x7a, 0x21, 0x2f, 0x75, 0x7b, 0x31, 0x3f, 0x63, 0x6d, 0x52, 0x5e, 0x00, 0x74, 0x7c, 0x41, 0x4f, 0x10, 0x20, 0x62, 0x6e, 0x30, 0x73, 0x7d, 0x51, 0x5f, 0x40, 0x72, 0x7e, 0x61, 0x6f, 0x50, 0x71, 0x7f, 0x60, 0x70]
+let num_transforms: usize = 4
+
+# mark: The decoder ===========================================================================
+
+## Where the top-level rows go.
+enum Sink:
+    ## Nowhere: a sub-image, kept whole.
+    keep
+    ## RGBA into the area.
+    rgba
+    ## Their green, as alpha, into the plane.
+    alpha
+
+## The codes and color cache of the stream being decoded (VP8LMetadata).
+struct Metadata:
+    var color_cache_size: usize
+    var color_cache: u32[]
+    var hash_shift: u32
+    ## The tile mask (all ones without a Huffman image), bits and width of the Huffman image.
+    var huffman_mask: usize
+    var huffman_subsample_bits: u32
+    var huffman_xsize: usize
+    var huffman_image: u32[]
+    var num_htree_groups: usize
+    var htree_groups: TreeGroup[]
+    var huffman_tables: HuffmanTables
+
+    ## ClearMetadata.
+    func clear():
+        if self.color_cache.length > 0:
+            free(self.color_cache) in memory.heap
+        if self.huffman_image.length > 0:
+            free(self.huffman_image) in memory.heap
+        if self.htree_groups.length > 0:
+            free(self.htree_groups) in memory.heap
+        self.huffman_tables.release()
+        var cleared: Metadata
+        self = cleared
+
+## A lossless decoder (VP8LDecoder).
+struct Lossless:
+    var br: LosslessBits
+    ## The size of the stream at hand (at the top level, after color indexing's bundling).
+    var width: usize
+    var height: usize
+    ## The picture's size.
+    var io_width: usize
+    var io_height: usize
+    var hdr: Metadata
+    var transforms: Transform[4]
+    var next_transform: usize
+    var transforms_seen: u32
+    ## The top-level pixels, then the row above the cache, then the cache of transformed
+    ## rows (argb_cache).
+    var pixels: u32[]
+    var argb_cache: usize
+    var last_row: usize
+    var last_pixel: usize
+    var last_out_row: usize
+    var sink: Sink = Sink.keep
+    ## The RGBA destination.
+    var area_pixels: u8[]
+    var area_stride: usize
+    ## The alpha plane, its filter, and its last row (prev_line).
+    var plane: u8[]
+    var filter: u8
+    var prev_line: usize?
+
+    func release():
+        self.hdr.clear()
+        for i in 0..<self.next_transform:
+            if self.transforms[i].data.length > 0:
+                free(self.transforms[i].data) in memory.heap
+        if self.pixels.length > 0:
+            free(self.pixels) in memory.heap
+
+# mark: Distances =============================================================================
+
+## GetCopyDistance: a length or distance from its prefix symbol and extra bits.
+inline func get_copy_distance(symbol: u32, br: LosslessBits*) -> usize:
+    if symbol < 4:
+        return (usize)symbol + 1
+    let extra_bits = (symbol - 2) >> 1
+    let offset = (2 + (symbol & 1)) << extra_bits
+    return (usize)(offset + br.read_bits(extra_bits)) + 1
+
+## PlaneCodeToDistance: a distance code to a distance in pixels, the first 120 codes a
+## neighbourhood in the 2D plane.
+inline func plane_code_to_distance(xsize: usize, plane_code: usize) -> usize:
+    if plane_code > 120:
+        return plane_code - 120
+    let dist_code = (i64)code_to_plane[plane_code - 1]
+    let yoffset = dist_code >> 4
+    let xoffset = 8 - (dist_code & 0xf)
+    let distance = yoffset * (i64)xsize + xoffset
+    return (usize)distance if distance >= 1 else 1
+
+## GetMetaIndex and GetHtreeGroupForPos: the group of the tile at (`x`, `y`).
+inline func group_for_pos(hdr: const Metadata*, x: usize, y: usize) -> const TreeGroup*:
+    if hdr.huffman_subsample_bits == 0:
+        return &hdr.htree_groups[0]
+    let bits = hdr.huffman_subsample_bits
+    return &hdr.htree_groups[(usize)hdr.huffman_image[hdr.huffman_xsize * (y >> bits) + (x >> bits)]]
+
+## ReadPackedSymbols: a whole literal pixel into `dst` (returning 0), or a non-literal
+## green symbol.
+inline func read_packed_symbols(group: const TreeGroup*, br: LosslessBits*, dst: u32*) -> u32:
+    let val = br.prefetch_bits() & 63
+    let code = (&group.packed_table[0])[(usize)val]
+    if code.bits < bits_special_marker:
+        br.bit_pos = br.bit_pos +% (u32)code.bits
+        dst[0] = code.value
+        return 0
+    br.bit_pos = br.bit_pos +% (u32)(code.bits -% bits_special_marker)
+    return code.value
+
+## VP8LHashPix and VP8LColorCacheInsert.
+inline func cache_insert(hdr: Metadata*, argb: u32):
+    hdr.color_cache.data[(usize)((argb *% 0x1e35a7bd) >> (hdr.hash_shift & 31))] = argb
+
+## CopyBlock32b: `length` pixels from `dist` back, overlapping as a repeating pattern.
+inline func copy_block32(dst: u32*, dist: usize, length: usize):
+    let src = dst - dist
+    if dist >= length:
+        memory.copy(u32[](dst, length), u32[]((u32*)src, length), length)
+        return
+    for i in 0..<length:
+        dst[i] = src[i]
+
+# mark: Streams ===============================================================================
+
+## ReadTransform: the next transform, and its data; color indexing narrows `xsize`.
+func read_transform(dec: Lossless*, xsize: usize*, ysize: usize) -> !:
+    let kind = dec.br.read_bits(2)
+    # Each transform at most once.
+    if (dec.transforms_seen & ((u32)1 << kind)) != 0:
+        error(corrupt, "VP8L transform appears twice")
+    dec.transforms_seen |= (u32)1 << kind
+    let index = dec.next_transform
+    dec.transforms[index] = Transform(kind = kind, bits = 0, xsize = *xsize, ysize = ysize)
+    dec.next_transform += 1
+    if kind == predictor_transform or kind == cross_color_transform:
+        let bits = 2 + dec.br.read_bits(3)
+        dec.transforms[index].bits = bits
+        dec.transforms[index].data = try decode_image_stream(dec, sub_sample_size(*xsize, bits), sub_sample_size(ysize, bits), false)
+    elif kind == color_indexing_transform:
+        let num_colors = (usize)dec.br.read_bits(8) + 1
+        let bits: u32 = 0 if num_colors > 16 else 1 if num_colors > 4 else 2 if num_colors > 2 else 3
+        *xsize = sub_sample_size(dec.transforms[index].xsize, bits)
+        dec.transforms[index].bits = bits
+        let palette = try decode_image_stream(dec, num_colors, 1, false)
+        defer free(palette) in memory.heap
+        # ExpandColorMap: the palette is delta coded, and spans every bundled value.
+        let final_num_colors = (usize)1 << ((u32)8 >> bits)
+        let expanded = try new u32[final_num_colors] in memory.heap
+        let data = u8[]((u8*)palette.data, 4 * num_colors)
+        let new_data = u8[]((u8*)expanded.data, 4 * final_num_colors)
+        expanded[0] = palette[0]
+        for i in 4..<4 * num_colors:
+            new_data[i] = data[i] +% new_data[i - 4]
+        dec.transforms[index].data = expanded
+
+## ReadHuffmanCodes: the codes of the stream, with the meta Huffman image where allowed.
+func read_huffman_codes(dec: Lossless*, xsize: usize, ysize: usize, color_cache_bits: u32, allow_recursion: bool) -> !:
+    var num_htree_groups: usize = 1
+    var num_htree_groups_max: usize = 1
+    var mapping: i32[]
+    defer:
+        if mapping.length > 0:
+            free(mapping) in memory.heap
+    var huffman_image: u32[]
+    errdefer:
+        if huffman_image.length > 0:
+            free(huffman_image) in memory.heap
+    var subsample_bits: u32 = 0
+    if allow_recursion and dec.br.read_bits(1) != 0:
+        # Meta Huffman codes.
+        let huffman_precision = 2 + dec.br.read_bits(3)
+        let huffman_xsize = sub_sample_size(xsize, huffman_precision)
+        let huffman_ysize = sub_sample_size(ysize, huffman_precision)
+        let huffman_pixs = huffman_xsize * huffman_ysize
+        huffman_image = try decode_image_stream(dec, huffman_xsize, huffman_ysize, false)
+        subsample_bits = huffman_precision
+        for i in 0..<huffman_pixs:
+            # The group is in the red and green bytes.
+            let group = (huffman_image[i] >> 8) & 0xffff
+            huffman_image[i] = group
+            if (usize)group >= num_htree_groups_max:
+                num_htree_groups_max = (usize)group + 1
+        # Too many groups for the image: only the ones used are kept, mapped to
+        # 0..num_htree_groups.
+        if num_htree_groups_max > 1000 or num_htree_groups_max > xsize * ysize:
+            mapping = try new i32[num_htree_groups_max] in memory.heap
+            memory.set(u8[]((u8*)mapping.data, num_htree_groups_max * 4), 0xff)
+            num_htree_groups = 0
+            for i in 0..<huffman_pixs:
+                let mapped_group = &mapping[(usize)huffman_image[i]]
+                if *mapped_group == -1:
+                    *mapped_group = (i32)num_htree_groups
+                    num_htree_groups += 1
+                huffman_image[i] = (u32)*mapped_group
+        else:
+            num_htree_groups = num_htree_groups_max
+    if dec.br.eos:
+        error(corrupt, "VP8L data ends in the Huffman image")
+    let groups = try new TreeGroup[num_htree_groups] in memory.heap
+    errdefer free(groups) in memory.heap
+    read_huffman_codes_helper(&dec.br, color_cache_bits, num_htree_groups, num_htree_groups_max, mapping, &dec.hdr.huffman_tables, groups) catch failure:
+        dec.hdr.huffman_tables.release()
+        error(failure.code, failure.message)
+    dec.hdr.huffman_subsample_bits = subsample_bits
+    dec.hdr.huffman_image = huffman_image
+    dec.hdr.num_htree_groups = num_htree_groups
+    dec.hdr.htree_groups = groups
+
+## DecodeImageStream: a stream of `xsize` by `ysize` pixels. At the top level it reads the
+## transforms and codes and leaves the pixels to the caller (returning nothing); a
+## sub-image is decoded whole and returned.
+func decode_image_stream(dec: Lossless*, xsize: usize, ysize: usize, is_level0: bool) -> u32[]!:
+    var transform_xsize = xsize
+    let transform_ysize = ysize
+    errdefer dec.hdr.clear()
+    if is_level0:
+        while dec.br.read_bits(1) != 0:
+            if dec.next_transform >= num_transforms:
+                error(corrupt, "VP8L has too many transforms")
+            try read_transform(dec, &transform_xsize, transform_ysize)
+    # The color cache.
+    var color_cache_bits: u32 = 0
+    if dec.br.read_bits(1) != 0:
+        color_cache_bits = dec.br.read_bits(4)
+        if color_cache_bits < 1 or color_cache_bits > max_cache_bits:
+            error(corrupt, "VP8L color cache size is invalid")
+    try read_huffman_codes(dec, transform_xsize, transform_ysize, color_cache_bits, is_level0)
+    if color_cache_bits > 0:
+        dec.hdr.color_cache_size = (usize)1 << color_cache_bits
+        dec.hdr.color_cache = try new u32[dec.hdr.color_cache_size] in memory.heap
+        dec.hdr.hash_shift = 32 - color_cache_bits
+    else:
+        dec.hdr.color_cache_size = 0
+    # UpdateDecoder.
+    dec.width = transform_xsize
+    dec.height = transform_ysize
+    let num_bits = dec.hdr.huffman_subsample_bits
+    dec.hdr.huffman_xsize = sub_sample_size(transform_xsize, num_bits)
+    dec.hdr.huffman_mask = ~(usize)0 if num_bits == 0 else ((usize)1 << num_bits) - 1
+    var nothing: u32[]
+    if is_level0:
+        return nothing
+    let data = try new u32[transform_xsize * transform_ysize] --- in memory.heap
+    errdefer free(data) in memory.heap
+    try decode_image_data(dec, data.data, transform_xsize, transform_ysize, transform_ysize)
+    if dec.br.eos:
+        error(corrupt, "VP8L sub-image data ends early")
+    dec.last_pixel = 0
+    dec.hdr.clear()
+    return data
+
+## DecodeImageData: pixels of the stream into `data` (`width` by `height`) up to row
+## `last_row`, handing rows on to the sink every sixteen rows and at the end.
+func decode_image_data(dec: Lossless*, data: u32*, width: usize, height: usize, last_row: usize) -> !:
+    var row = dec.last_pixel // width
+    var col = dec.last_pixel % width
+    let br = &dec.br
+    let hdr = &dec.hdr
+    var src = dec.last_pixel
+    var last_cached = src
+    let src_end = width * height
+    let src_last = width * last_row
+    let len_code_limit = num_literal_codes + num_length_codes
+    let color_cache_limit = len_code_limit + (u32)hdr.color_cache_size
+    let use_cache = hdr.color_cache_size > 0
+    let mask = hdr.huffman_mask
+    let codes = hdr.huffman_tables.codes.data
+    var group: const TreeGroup* = &hdr.htree_groups[0]
+    if src < src_last:
+        group = group_for_pos(hdr, col, row)
+    while src < src_last:
+        # Only when the tile changes.
+        if (col & mask) == 0:
+            group = group_for_pos(hdr, col, row)
+        if group.is_trivial_code:
+            data[src] = group.literal_arb
+        else:
+            br.fill_bit_window()
+            var code: u32 = 0
+            var have_symbol = true
+            if group.use_packed_table:
+                code = read_packed_symbols(group, br, data + src)
+                if br.is_end_of_stream():
+                    break
+                # A whole literal pixel was written.
+                have_symbol = code != 0
+            else:
+                code = read_symbol(codes + group.htrees[huff_green], br)
+            if have_symbol:
+                if br.is_end_of_stream():
+                    break
+                if code < num_literal_codes:
+                    if group.is_trivial_literal:
+                        data[src] = group.literal_arb | (code << 8)
+                    else:
+                        let red_symbol = read_symbol(codes + group.htrees[huff_red], br)
+                        br.fill_bit_window()
+                        let blue_symbol = read_symbol(codes + group.htrees[huff_blue], br)
+                        let alpha_symbol = read_symbol(codes + group.htrees[huff_alpha], br)
+                        if br.is_end_of_stream():
+                            break
+                        data[src] = (alpha_symbol << 24) | (red_symbol << 16) | (code << 8) | blue_symbol
+                elif code < len_code_limit:
+                    # A backward reference.
+                    let length = get_copy_distance(code - num_literal_codes, br)
+                    let dist_symbol = read_symbol(codes + group.htrees[huff_dist], br)
+                    br.fill_bit_window()
+                    let dist_code = get_copy_distance(dist_symbol, br)
+                    let distance = plane_code_to_distance(width, dist_code)
+                    if br.is_end_of_stream():
+                        break
+                    if src < distance or src_end - src < length:
+                        error(corrupt, "VP8L backward reference is out of range")
+                    copy_block32(data + src, distance, length)
+                    src += length
+                    col += length
+                    while col >= width:
+                        col -= width
+                        row += 1
+                        if row <= last_row and row % num_argb_cache_rows == 0:
+                            try process_rows(dec, row)
+                    if (col & mask) != 0:
+                        group = group_for_pos(hdr, col, row)
+                    if use_cache:
+                        while last_cached < src:
+                            cache_insert(hdr, data[last_cached])
+                            last_cached += 1
+                    continue
+                elif code < color_cache_limit:
+                    # A color cache hit.
+                    let key = code - len_code_limit
+                    while last_cached < src:
+                        cache_insert(hdr, data[last_cached])
+                        last_cached += 1
+                    data[src] = hdr.color_cache[(usize)key]
+                else:
+                    error(corrupt, "VP8L symbol is out of range")
+        # AdvanceByOne.
+        src += 1
+        col += 1
+        if col >= width:
+            col = 0
+            row += 1
+            if row <= last_row and row % num_argb_cache_rows == 0:
+                try process_rows(dec, row)
+            if use_cache:
+                while last_cached < src:
+                    cache_insert(hdr, data[last_cached])
+                    last_cached += 1
+    br.eos = br.is_end_of_stream()
+    if br.eos:
+        error(corrupt, "VP8L data ends early")
+    # The rows of the last batch.
+    try process_rows(dec, row if row < last_row else last_row)
+    dec.last_pixel = src

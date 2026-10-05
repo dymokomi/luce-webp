@@ -1,0 +1,232 @@
+# libwebp 1.6.0's portable C build on these files (luce-browser-tools/oracles/luce-webp, webp_oracle_scalar)
+ladybird/4-with-8-partitions.webp ok 1024 772 0 0 1 0 00000000 -
+frame 0 0 975fe43c04a8595a
+ladybird/4.webp ok 1024 772 0 0 1 0 00000000 -
+frame 0 0 c9c8537bcf09927f
+ladybird/Qpalette.webp ok 256 256 0 0 1 0 00000000 -
+frame 0 0 4082af158239d725
+ladybird/catdog-alert-13-alpha-used-false.webp ok 32 32 0 0 1 0 00000000 -
+frame 0 0 29bc69fa11a28663
+ladybird/catdog-alert-13.webp ok 32 32 1 0 1 0 00000000 -
+frame 0 0 29bc69fa11a28663
+ladybird/catdog-alert-2.webp ok 32 32 0 0 1 0 00000000 -
+frame 0 0 2eb7256d3c352145
+ladybird/catdog-alert-3.webp ok 32 32 1 0 1 0 00000000 -
+frame 0 0 d7c19f8e58e6f5bf
+ladybird/catdog-alert-8.webp ok 32 32 1 0 1 0 00000000 -
+frame 0 0 38b510c9951e12ae
+ladybird/extended-lossless-animated.webp ok 990 1050 1 1 8 42 00ffffff -
+frame 0 100 9a19996532ebc015
+frame 1 100 8b7e7a92020dd165
+frame 2 100 d02496d2e3c61c0d
+frame 3 100 97a876a634588d1d
+frame 4 100 f8e5bee358a10af5
+frame 5 100 2cbd7f11f88e4dc5
+frame 6 100 64a0ac0107e8592d
+frame 7 100 95b97d96c847ff7d
+ladybird/extended-lossless.webp ok 417 223 1 0 1 0 00000000 4032:b9ea0d0c86b1ef9f
+frame 0 0 33512ccf0aebe5cc
+ladybird/extended-lossy-uncompressed-alpha.webp ok 417 223 1 0 1 0 00000000 -
+frame 0 0 059d067791abd134
+ladybird/extended-lossy.webp ok 417 223 1 0 1 0 00000000 4032:b9ea0d0c86b1ef9f
+frame 0 0 17a2b999a75e6b2b
+ladybird/semi-transparent-pixel.webp ok 1 1 1 0 1 0 00000000 -
+frame 0 0 994f1f653e29a57c
+ladybird/simple-vp8.webp ok 240 240 0 0 1 0 00000000 -
+frame 0 0 f7816a3631a2fb47
+ladybird/simple-vp8l-alpha-used-false.webp ok 386 395 0 0 1 0 00000000 -
+frame 0 0 cad9b3d7d846d372
+ladybird/simple-vp8l.webp ok 386 395 1 0 1 0 00000000 -
+frame 0 0 cad9b3d7d846d372
+ladybird/smolkling-gradient-alpha.webp ok 264 264 1 0 1 0 00000000 -
+frame 0 0 677b512ddb7bfd97
+ladybird/smolkling-horizontal-alpha.webp ok 264 264 1 0 1 0 00000000 -
+frame 0 0 1d4e6c5454263383
+ladybird/smolkling-vertical-alpha.webp ok 264 264 1 0 1 0 00000000 -
+frame 0 0 0e1aaa70cf728971
+ladybird/smolkling.webp ok 264 264 0 0 1 0 00000000 -
+frame 0 0 2464ea2d11e4c28d
+ladybird/width11-height11-colors15.webp ok 11 11 0 0 1 0 00000000 -
+frame 0 0 1a6b0eead5735745
+ladybird/width11-height11-colors2.webp ok 11 11 0 0 1 0 00000000 -
+frame 0 0 5ccea7b135577d70
+ladybird/width11-height11-colors3.webp ok 11 11 0 0 1 0 00000000 -
+frame 0 0 708db7fa763aba54
+synthetic/alpha-15x15.webp ok 15 15 1 0 1 0 00000000 -
+frame 0 0 a3c74d7b68ca48a3
+synthetic/alpha-16x16.webp ok 16 16 1 0 1 0 00000000 -
+frame 0 0 69bbdb468f93890c
+synthetic/alpha-1x1.webp ok 1 1 0 0 1 0 00000000 -
+frame 0 0 4ff9f79ea896a90d
+synthetic/alpha-2x2.webp ok 2 2 1 0 1 0 00000000 -
+frame 0 0 7a18157f3d782348
+synthetic/alpha-3x7.webp ok 3 7 1 0 1 0 00000000 -
+frame 0 0 661191abb44cfdc5
+synthetic/alpha-mask-m0-fast.webp ok 97 61 1 0 1 0 00000000 -
+frame 0 0 6773591e29c9212f
+synthetic/alpha-mask-m1-fast.webp ok 97 61 1 0 1 0 00000000 -
+frame 0 0 6773591e29c9212f
+synthetic/alpha-noise-m0-fast.webp ok 97 61 1 0 1 0 00000000 -
+frame 0 0 6a80af59c6fa0c1c
+synthetic/alpha-noise-m1-fast.webp ok 97 61 1 0 1 0 00000000 -
+frame 0 0 6a80af59c6fa0c1c
+synthetic/alpha-ramp-m0-fast.webp ok 97 61 1 0 1 0 00000000 -
+frame 0 0 87ce7efffa6bb3f7
+synthetic/alpha-ramp-m1-fast.webp ok 97 61 1 0 1 0 00000000 -
+frame 0 0 87ce7efffa6bb3f7
+synthetic/anim-lossless.webp ok 48 36 1 1 5 3 ffffffff -
+frame 0 20 ea651c120acf888d
+frame 1 40 ccc1ac5a21807d5c
+frame 2 60 c7746382408c7966
+frame 3 80 94df11409efbedd5
+frame 4 100 836f2c5279c04b06
+synthetic/anim-lossy.webp ok 48 36 1 1 5 0 ffffffff -
+frame 0 20 94218490e0967bdd
+frame 1 40 ef696868322dc527
+frame 2 60 bebc695946e1d1d6
+frame 3 80 dc8a5449b4bc7484
+frame 4 100 984d2c8c16da2c5b
+synthetic/anim-mixed.webp ok 48 36 1 1 5 0 ffffffff -
+frame 0 20 a2245e863da3c1cd
+frame 1 40 7324a4585925a31d
+frame 2 60 9b82fcd89a2558a9
+frame 3 80 a9d009da07c34bc1
+frame 4 100 e9ac651659be5eb4
+synthetic/damaged-cut115-lossless-3x7.webp error mux
+synthetic/damaged-cut1759-icc-lossless.webp error mux
+synthetic/damaged-cut181-palette-2-z9.webp error mux
+synthetic/damaged-cut212-lossless-16x16.webp error mux
+synthetic/damaged-cut246-palette-16-z9.webp error mux
+synthetic/damaged-cut2469-anim-mixed.webp error anim
+synthetic/damaged-cut3884-lossy-q75.webp error mux
+synthetic/damaged-cut4028-alpha-noise-m0-fast.webp error mux
+synthetic/damaged-cut423-lossless-16x16.webp error mux
+synthetic/damaged-cut4527-lossy-sns100.webp error mux
+synthetic/damaged-cut491-palette-16-z9.webp error mux
+synthetic/damaged-cut4937-anim-mixed.webp error anim
+synthetic/damaged-cut58-lossless-3x7.webp error mux
+synthetic/damaged-cut7767-lossy-q75.webp error mux
+synthetic/damaged-cut8055-alpha-noise-m0-fast.webp error mux
+synthetic/damaged-cut880-icc-lossless.webp error mux
+synthetic/damaged-cut9053-lossy-sns100.webp error mux
+synthetic/damaged-cut91-palette-2-z9.webp error mux
+synthetic/damaged-flip0-alpha-noise-m0-fast.webp ok 97 61 1 0 1 0 00000000 -
+frame 0 0 726e4014421df662
+synthetic/damaged-flip0-anim-mixed.webp ok 48 36 1 1 5 0 ffffffff -
+frame 0 20 fbadf5f0bfc48e9e
+frame 1 40 7324a4585925a31d
+frame 2 60 9b82fcd89a2558a9
+frame 3 80 a9d009da07c34bc1
+frame 4 100 e9ac651659be5eb4
+synthetic/damaged-flip0-icc-lossless.webp ok 40 30 0 0 1 0 00000000 536:e8dc2db98a97df76
+frame 0 0 6a299bf60c89781f
+synthetic/damaged-flip0-lossless-16x16.webp ok 16 16 0 0 1 0 00000000 -
+frame 0 0 741a9a8e9d67c04b
+synthetic/damaged-flip0-lossless-3x7.webp ok 1 7 0 0 1 0 00000000 -
+frame 0 0 43c6d8c62212dac2
+synthetic/damaged-flip0-lossy-q75.webp ok 203 157 0 0 1 0 00000000 -
+frame 0 0 2e4f3a26ef046e2b
+synthetic/damaged-flip0-lossy-sns100.webp ok 203 157 0 0 1 0 00000000 -
+frame 0 0 518ddf6088070c2d
+synthetic/damaged-flip0-palette-16-z9.webp ok 40 23 1 0 1 0 00000000 -
+frame 0 0 e6bdc71942fb9ebc
+synthetic/damaged-flip0-palette-2-z9.webp ok 38 23 1 0 1 0 00000000 -
+frame 0 0 4ae27ff3bc79e1c9
+synthetic/gif-dispose_bgnd.webp ok 100 100 1 1 5 0 ff1e90ff -
+frame 0 1000 4c187b7e1c59742e
+frame 1 1000 7b46043c612f60dd
+frame 2 1000 eba192f15d6893c6
+frame 3 1000 42afcf9492ca14c7
+frame 4 1000 10739d7c09d74f0b
+synthetic/gif-dispose_none.webp ok 100 100 1 1 5 0 ff1e90ff -
+frame 0 1000 4c187b7e1c59742e
+frame 1 1000 7b46043c612f60dd
+frame 2 1000 46da60a601dfcb7a
+frame 3 1000 ee839f573930f864
+frame 4 1000 287b8cea8bc869dc
+synthetic/gif-dispose_prev.webp ok 100 100 1 1 5 0 ff1e90ff -
+frame 0 100 4c187b7e1c59742e
+frame 1 1000 7b46043c612f60dd
+frame 2 1000 48f6e4b487add761
+frame 3 1000 b9042c3b11503784
+frame 4 1000 4c1dbb8cb0f13878
+synthetic/gif-transparent_dispose.webp ok 3 1 1 1 3 1 ff00ff18 -
+frame 0 100 1def6b880ac9606b
+frame 1 500 d22fbf767f64785b
+frame 2 500 1def6b880ac9606b
+synthetic/icc-lossless.webp ok 40 30 0 0 1 0 00000000 536:98f64b1bf5c53cee
+frame 0 0 6a299bf60c89781f
+synthetic/icc-lossy.webp ok 40 30 0 0 1 0 00000000 536:98f64b1bf5c53cee
+frame 0 0 f6868258ac36ecce
+synthetic/lossless-15x15.webp ok 15 15 0 0 1 0 00000000 -
+frame 0 0 700cde295f0d5d61
+synthetic/lossless-16x16.webp ok 16 16 0 0 1 0 00000000 -
+frame 0 0 468800277996c3f3
+synthetic/lossless-1x1.webp ok 1 1 0 0 1 0 00000000 -
+frame 0 0 863201769655e461
+synthetic/lossless-2x2.webp ok 2 2 0 0 1 0 00000000 -
+frame 0 0 f96306ae2879d565
+synthetic/lossless-3x7.webp ok 3 7 0 0 1 0 00000000 -
+frame 0 0 91d4beb272e4efc6
+synthetic/lossless-z0.webp ok 203 157 0 0 1 0 00000000 -
+frame 0 0 e10ff7165f723902
+synthetic/lossless-z6.webp ok 203 157 0 0 1 0 00000000 -
+frame 0 0 e10ff7165f723902
+synthetic/lossless-z9.webp ok 203 157 0 0 1 0 00000000 -
+frame 0 0 e10ff7165f723902
+synthetic/lossy-15x15.webp ok 15 15 0 0 1 0 00000000 -
+frame 0 0 e1878351b3b672f9
+synthetic/lossy-16x16.webp ok 16 16 0 0 1 0 00000000 -
+frame 0 0 309d0c1c34d07fd0
+synthetic/lossy-1x1.webp ok 1 1 0 0 1 0 00000000 -
+frame 0 0 1716ec7657d477f7
+synthetic/lossy-2x2.webp ok 2 2 0 0 1 0 00000000 -
+frame 0 0 c6a052b94b797f85
+synthetic/lossy-3x7.webp ok 3 7 0 0 1 0 00000000 -
+frame 0 0 7e2c9d63623934e4
+synthetic/lossy-f0.webp ok 203 157 0 0 1 0 00000000 -
+frame 0 0 475a3cea297ca738
+synthetic/lossy-q0.webp ok 203 157 0 0 1 0 00000000 -
+frame 0 0 4395d474016b5cef
+synthetic/lossy-q100-m6.webp ok 203 157 0 0 1 0 00000000 -
+frame 0 0 d709a666f43e67e8
+synthetic/lossy-q30-m0.webp ok 203 157 0 0 1 0 00000000 -
+frame 0 0 93f1843b5099dc3d
+synthetic/lossy-q75.webp ok 203 157 0 0 1 0 00000000 -
+frame 0 0 58e6ddb21d4b881a
+synthetic/lossy-seg1.webp ok 203 157 0 0 1 0 00000000 -
+frame 0 0 949bd1fe0a7424e4
+synthetic/lossy-seg2-sns0.webp ok 203 157 0 0 1 0 00000000 -
+frame 0 0 99f6f804c9f93f12
+synthetic/lossy-sns100.webp ok 203 157 0 0 1 0 00000000 -
+frame 0 0 10eb8b23920ab746
+synthetic/meta-base.webp ok 97 61 1 0 1 0 00000000 -
+frame 0 0 87ce7efffa6bb3f7
+synthetic/meta-exif-xmp.webp ok 97 61 1 0 1 0 00000000 -
+frame 0 0 87ce7efffa6bb3f7
+synthetic/meta-icc-set.webp ok 97 61 1 0 1 0 00000000 536:98f64b1bf5c53cee
+frame 0 0 87ce7efffa6bb3f7
+synthetic/palette-16-alpha-lossy.webp ok 40 23 1 0 1 0 00000000 -
+frame 0 0 e3a74ec7b6ba18b0
+synthetic/palette-16-z9.webp ok 40 23 1 0 1 0 00000000 -
+frame 0 0 4112f84481b72d43
+synthetic/palette-16.webp ok 40 23 1 0 1 0 00000000 -
+frame 0 0 4112f84481b72d43
+synthetic/palette-17-alpha-lossy.webp ok 37 23 1 0 1 0 00000000 -
+frame 0 0 eacfe2e75dcfa070
+synthetic/palette-17-z9.webp ok 37 23 1 0 1 0 00000000 -
+frame 0 0 807a16d08ef11bdb
+synthetic/palette-17.webp ok 37 23 1 0 1 0 00000000 -
+frame 0 0 807a16d08ef11bdb
+synthetic/palette-2-alpha-lossy.webp ok 40 23 1 0 1 0 00000000 -
+frame 0 0 9905c8ab1c746e40
+synthetic/palette-2-z9.webp ok 40 23 1 0 1 0 00000000 -
+frame 0 0 c297c58350dec600
+synthetic/palette-2.webp ok 40 23 1 0 1 0 00000000 -
+frame 0 0 c297c58350dec600
+synthetic/palette-3-alpha-lossy.webp ok 37 23 1 0 1 0 00000000 -
+frame 0 0 35d0f2e872807380
+synthetic/palette-3-z9.webp ok 37 23 1 0 1 0 00000000 -
+frame 0 0 ad6f67248efacab9
+synthetic/palette-3.webp ok 37 23 1 0 1 0 00000000 -
+frame 0 0 ad6f67248efacab9

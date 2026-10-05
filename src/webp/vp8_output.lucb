@@ -1,0 +1,180 @@
+#==============================================================================================
+#
+#   webp/vp8_output - VP8 rows to RGBA: fancy upsampling and alpha
+#
+#   DESCRIPTION:
+#       Port of dec/io_dec.c's RGBA path as WebPDecodeRGBAInto takes it (CustomPut with
+#       EmitFancyRGB and EmitAlphaRGB) and of dsp/upsampling.c and dsp/yuv.h. The fancy
+#       upsampler interpolates the half-resolution U and V planes between each pair of
+#       luma rows (9-3-3-1 weights), so a row waits for the next call to be finished: the
+#       last luma, U and V rows of a call are kept and the row goes out with the next
+#       call. YUV becomes RGB in libwebp's 14-bit fixed point (BT.601, limited range).
+#       Alpha rows follow one row behind the color rows for the same reason.
+#
+#==============================================================================================
+
+# mark: YUV to RGB ============================================================================
+
+## MultHi: (v * coeff) >> 8, _mm_mulhi_epu16's emulation.
+inline func mult_hi(v: i32, coeff: i32) -> i32:
+    return (v *% coeff) >> 8
+
+## VP8Clip8: a 14-bit fixed-point value to 0..255.
+inline func clip8(v: i32) -> u8:
+    return (u8)(v >> 6) if (v & ~16383) == 0 else 0 if v < 0 else 255
+
+## VP8YuvToRgba: one pixel, opaque.
+inline func yuv_to_rgba(y: u8, u: u8, v: u8, rgba: u8*):
+    let my = mult_hi((i32)y, 19077)
+    rgba[0] = clip8(my +% mult_hi((i32)v, 26149) -% 14234)
+    rgba[1] = clip8(my -% mult_hi((i32)u, 6419) -% mult_hi((i32)v, 13320) +% 8708)
+    rgba[2] = clip8(my +% mult_hi((i32)u, 33050) -% 17685)
+    rgba[3] = 0xff
+
+## UpsampleRgbaLinePair: two luma rows (or the top one alone) with the U and V rows above
+## and below them, into two RGBA rows of `len` pixels. U and V travel together in one
+## 32-bit word, U in the low half.
+func upsample_line_pair(top_y: const u8*, bottom_y: const u8*?, top_u: const u8*, top_v: const u8*, cur_u: const u8*, cur_v: const u8*, top_dst: u8*, bottom_dst: u8*?, len: usize):
+    let has_bottom = bottom_y != none
+    let bottom = bottom_y else top_y
+    let bottom_out = bottom_dst else top_dst
+    let last_pixel_pair = (len - 1) >> 1
+    var tl_uv = (u32)top_u[0] | ((u32)top_v[0] << 16)
+    var l_uv = (u32)cur_u[0] | ((u32)cur_v[0] << 16)
+    let uv0 = (3 * tl_uv + l_uv + 0x00020002) >> 2
+    yuv_to_rgba(top_y[0], (u8)(uv0 & 0xff), (u8)(uv0 >> 16), top_dst)
+    if has_bottom:
+        let uv1 = (3 * l_uv + tl_uv + 0x00020002) >> 2
+        yuv_to_rgba(bottom[0], (u8)(uv1 & 0xff), (u8)(uv1 >> 16), bottom_out)
+    for x in 1..<last_pixel_pair + 1:
+        let t_uv = (u32)top_u[x] | ((u32)top_v[x] << 16)
+        let uv = (u32)cur_u[x] | ((u32)cur_v[x] << 16)
+        # The values shared by the first and second diagonals.
+        let avg = tl_uv + t_uv + l_uv + uv + 0x00080008
+        let diag_12 = (avg + 2 * (t_uv + l_uv)) >> 3
+        let diag_03 = (avg + 2 * (tl_uv + uv)) >> 3
+        let a = (diag_12 + tl_uv) >> 1
+        let b = (diag_03 + t_uv) >> 1
+        yuv_to_rgba(top_y[2 * x - 1], (u8)(a & 0xff), (u8)(a >> 16), top_dst + (2 * x - 1) * 4)
+        yuv_to_rgba(top_y[2 * x], (u8)(b & 0xff), (u8)(b >> 16), top_dst + 2 * x * 4)
+        if has_bottom:
+            let c = (diag_03 + l_uv) >> 1
+            let d = (diag_12 + uv) >> 1
+            yuv_to_rgba(bottom[2 * x - 1], (u8)(c & 0xff), (u8)(c >> 16), bottom_out + (2 * x - 1) * 4)
+            yuv_to_rgba(bottom[2 * x], (u8)(d & 0xff), (u8)(d >> 16), bottom_out + 2 * x * 4)
+        tl_uv = t_uv
+        l_uv = uv
+    if (len & 1) == 0:
+        let e = (3 * tl_uv + l_uv + 0x00020002) >> 2
+        yuv_to_rgba(top_y[len - 1], (u8)(e & 0xff), (u8)(e >> 16), top_dst + (len - 1) * 4)
+        if has_bottom:
+            let f = (3 * l_uv + tl_uv + 0x00020002) >> 2
+            yuv_to_rgba(bottom[len - 1], (u8)(f & 0xff), (u8)(f >> 16), bottom_out + (len - 1) * 4)
+
+# mark: The output ============================================================================
+
+## Where a picture's RGBA goes: rows of `stride` bytes from `pixels`, `size` bytes in all
+## (WebPRGBABuffer).
+struct Area:
+    var pixels: u8*
+    var stride: usize
+    var size: usize
+
+## The RGBA output of a VP8 picture (WebPDecParams with its fancy upsampler).
+struct Output:
+    var area: Area
+    var width: usize
+    var height: usize
+    ## The last luma row of the last call, and its U and V rows (tmp_y, tmp_u, tmp_v).
+    var tmp: u8[]
+    var alpha: Alpha
+
+    ## The output of `dec`'s picture into `area`, with `alpha` (CustomSetup).
+    static func start(dec: const Vp8*, area: Area, alpha: Alpha) -> Output!:
+        let uv_width = (dec.width + 1) >> 1
+        return Output(area = area, width = dec.width, height = dec.height, tmp = try new u8[dec.width + 2 * uv_width] --- in memory.heap, alpha = alpha)
+
+    func release():
+        free(self.tmp) in memory.heap
+        self.alpha.release()
+
+    ## CustomPut: picture rows `mb_y` to `mb_y + mb_h` of the cache at `rows`.
+    func put(dec: const Vp8*, fb: const FrameBuffers*, rows: Rows, mb_y: usize, mb_h: usize) -> !:
+        let lines = self.emit_fancy_rgb(fb, rows, mb_y, mb_h)
+        if self.alpha.present:
+            let alpha = try self.alpha.rows(mb_y, mb_h)
+            self.emit_alpha_rgb(alpha, mb_y, mb_h, lines)
+
+    ## EmitFancyRGB: the rows of this call, finishing the row the last call left; returns
+    ## how many rows went out.
+    func emit_fancy_rgb(fb: const FrameBuffers*, rows: Rows, mb_y: usize, mb_h: usize) -> usize:
+        var num_lines_out = mb_h
+        let stride = self.area.stride
+        let y_stride = fb.cache_y_stride
+        let uv_stride = fb.cache_uv_stride
+        let mb_w = self.width
+        let uv_w = (mb_w + 1) // 2
+        let tmp_y = self.tmp.data
+        let tmp_u = tmp_y + mb_w
+        let tmp_v = tmp_u + uv_w
+        var dst = self.area.pixels + mb_y * stride
+        var cur_y = rows.y
+        var cur_u = rows.u
+        var cur_v = rows.v
+        var top_u: const u8* = tmp_u
+        var top_v: const u8* = tmp_v
+        var y = mb_y
+        let y_end = mb_y + mb_h
+        if y == 0:
+            # The first row: the U and V samples mirrored at the boundary.
+            upsample_line_pair(cur_y, none, cur_u, cur_v, cur_u, cur_v, dst, none, mb_w)
+        else:
+            # The row left over from the last call.
+            upsample_line_pair(tmp_y, cur_y, top_u, top_v, cur_u, cur_v, dst - stride, dst, mb_w)
+            num_lines_out += 1
+        # Each pair of rows.
+        while y + 2 < y_end:
+            top_u = cur_u
+            top_v = cur_v
+            cur_u = cur_u + uv_stride
+            cur_v = cur_v + uv_stride
+            dst = dst + 2 * stride
+            cur_y = cur_y + 2 * y_stride
+            upsample_line_pair(cur_y - y_stride, cur_y, top_u, top_v, cur_u, cur_v, dst - stride, dst, mb_w)
+            y += 2
+        # The last row.
+        cur_y = cur_y + y_stride
+        if y_end < self.height:
+            # Kept for the next call: the upsampler leaves a row unfinished.
+            copy_bytes(tmp_y, cur_y, mb_w)
+            copy_bytes(tmp_u, cur_u, uv_w)
+            copy_bytes(tmp_v, cur_v, uv_w)
+            num_lines_out -= 1
+        elif (y_end & 1) == 0:
+            # The very last row of an even-sized picture.
+            upsample_line_pair(cur_y, none, cur_u, cur_v, cur_u, cur_v, dst + stride, none, mb_w)
+        return num_lines_out
+
+    ## EmitAlphaRGB: the alpha of the rows that went out, one row behind the color rows as
+    ## the upsampler is (GetAlphaSourceRow); `alpha` is the plane's row `mb_y`.
+    func emit_alpha_rgb(alpha: const u8*, mb_y: usize, mb_h: usize, expected: usize):
+        var start_y = mb_y
+        var num_rows = mb_h
+        var source = alpha
+        if start_y == 0:
+            # The last row is done in the next call.
+            num_rows -= 1
+        else:
+            start_y -= 1
+            source = source - self.width
+        if mb_y + mb_h == self.height:
+            # The very last call takes every row left.
+            num_rows = self.height - start_y
+        _ = expected
+        # WebPDispatchAlpha into the fourth byte of each pixel.
+        var dst = self.area.pixels + start_y * self.area.stride + 3
+        for j in 0..<num_rows:
+            for i in 0..<self.width:
+                dst[4 * i] = source[i]
+            source = source + self.width
+            dst = dst + self.area.stride

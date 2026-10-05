@@ -1,0 +1,437 @@
+#==============================================================================================
+#
+#   webp/demux - The demuxer: the frames of a file
+#
+#   DESCRIPTION:
+#       Port of demux/demux.c for a whole file (WebPDemux, partial data refused): the RIFF
+#       header, then a simple file's one image or an extended file's VP8X chunk and the
+#       chunks after it: ANIM (background color, loop count), ANMF frames with their ALPH
+#       and VP8 or VP8L chunks, a still image's chunks, and the chunks it skips (ICCP,
+#       EXIF, XMP, unknown ones). The file is then validated as libwebp validates it
+#       (IsValidSimpleFormat, IsValidExtendedFormat). Bytes without a RIFF header are a raw
+#       VP8 or VP8L image (CreateRawImageDemuxer).
+#
+#==============================================================================================
+
+## The parser's outcome (ParseStatus).
+enum Parse:
+    ok
+    need_more_data
+    error
+
+## The size of an ANMF chunk's header and of an ANIM chunk.
+let anmf_chunk_size: usize = 16
+let anim_chunk_size: usize = 6
+
+## A frame of the file (demux.c's Frame).
+struct DemuxFrame:
+    var x_offset: usize
+    var y_offset: usize
+    var width: usize
+    var height: usize
+    var has_alpha: bool
+    ## Milliseconds, as written.
+    var duration: u32
+    ## WEBP_MUX_DISPOSE_BACKGROUND, and WEBP_MUX_BLEND.
+    var dispose_background: bool
+    var blend: bool
+    var frame_num: usize
+    ## Whether its chunks are all there.
+    var complete: bool
+    ## The VP8 or VP8L chunk and the ALPH chunk: where each starts and its size, header
+    ## included (img_components).
+    var image_offset: usize
+    var image_size: usize
+    var alpha_offset: usize
+    var alpha_size: usize
+
+    ## GetFramePayload: the bytes WebPDecode takes for the frame, ALPH (and any chunk
+    ## between) and the image.
+    func payload(data: const u8[]) -> const u8[]:
+        var start = self.image_offset
+        var size = self.image_size
+        if self.alpha_size > 0:
+            let inter_size = self.image_offset - (self.alpha_offset + self.alpha_size) if self.image_offset > 0 else 0
+            start = self.alpha_offset
+            size += self.alpha_size + inter_size
+        return data[start..<start + size]
+
+## The demuxer's view of a file (WebPDemuxer).
+struct Demuxer:
+    ## The file, cut at the RIFF chunk's end; the parse position and the RIFF end.
+    var data: const u8[]
+    var start: usize
+    var riff_end: usize
+    var is_ext_format: bool
+    var parsed_header: bool
+    var done: bool
+    var feature_flags: u32
+    var canvas_width: i64 = -1
+    var canvas_height: i64 = -1
+    var loop_count: u32 = 1
+    ## White by default.
+    var background: u32 = 0xffffffff
+    var frames: DemuxFrame[]
+    var count: usize
+
+    ## WebPDemux: the demuxer of the whole file `data`; fails where libwebp's does.
+    static func open(data: const u8[]) -> Demuxer!:
+        var dmux = Demuxer(data = data)
+        errdefer dmux.release()
+        let header = dmux.read_header()
+        if header == Parse.error:
+            try dmux.raw_image()
+            return dmux
+        if header != Parse.ok:
+            error(corrupt, "WebP file is too short for its header")
+        # Partial data is refused.
+        if dmux.data.length < dmux.riff_end:
+            error(corrupt, "WebP file ends before its RIFF chunk")
+        var status = Parse.error
+        var simple = false
+        if holds(dmux.data, dmux.start, "VP8 ") or holds(dmux.data, dmux.start, "VP8L"):
+            status = try dmux.parse_single_image()
+            simple = true
+        elif holds(dmux.data, dmux.start, "VP8X"):
+            status = try dmux.parse_vp8x()
+        if status == Parse.ok:
+            dmux.done = true
+        if status == Parse.need_more_data:
+            status = Parse.error
+        if status != Parse.error and not (dmux.valid_simple() if simple else dmux.valid_extended()):
+            status = Parse.error
+        if status == Parse.error:
+            error(corrupt, "WebP file's chunks are invalid")
+        return dmux
+
+    func release():
+        if self.frames.length > 0:
+            free(self.frames) in memory.heap
+        var empty: DemuxFrame[]
+        self.frames = empty
+
+    ## The frames found, in order.
+    func frame_list() -> const DemuxFrame[]:
+        return self.frames[..<self.count]
+
+    # mark: Reading ===========================================================================
+
+    ## MemDataSize: the bytes left.
+    func left() -> usize:
+        return self.data.length - self.start
+
+    ## SizeIsInvalid: whether `size` bytes run past the RIFF chunk.
+    func size_is_invalid(size: u64) -> bool:
+        return size > (u64)(self.riff_end - self.start)
+
+    func read_byte() -> u32:
+        let byte = (u32)self.data[self.start]
+        self.start += 1
+        return byte
+
+    func read_le16() -> u32:
+        let value = le16(self.data, self.start)
+        self.start += 2
+        return value
+
+    func read_le24() -> u32:
+        let value = le24(self.data, self.start)
+        self.start += 3
+        return value
+
+    func read_le32() -> u32:
+        let value = le32(self.data, self.start)
+        self.start += 4
+        return value
+
+    ## ReadHeader: the RIFF header, cutting the data at the RIFF chunk's end.
+    func read_header() -> Parse:
+        if self.left() < riff_header_size + chunk_header_size:
+            return Parse.need_more_data
+        if not holds(self.data, 0, "RIFF") or not holds(self.data, chunk_header_size, "WEBP"):
+            return Parse.error
+        let riff_size = (u64)le32(self.data, tag_size)
+        if riff_size < (u64)chunk_header_size or riff_size > max_chunk_payload:
+            return Parse.error
+        # Nothing past the RIFF chunk is read.
+        self.riff_end = (usize)riff_size + chunk_header_size
+        if self.data.length > self.riff_end:
+            self.data = self.data[..<self.riff_end]
+        self.start += riff_header_size
+        return Parse.ok
+
+    ## CreateRawImageDemuxer: a raw VP8 or VP8L bitstream as one frame.
+    func raw_image() -> !:
+        let found = try features(self.data)
+        try self.add_frame(DemuxFrame(width = found.width, height = found.height, has_alpha = found.alpha, frame_num = 1, complete = true, image_offset = 0, image_size = self.data.length))
+        self.done = true
+        self.canvas_width = (i64)found.width
+        self.canvas_height = (i64)found.height
+        if found.alpha:
+            self.feature_flags |= alpha_flag
+
+    # mark: Frames ============================================================================
+
+    ## AddFrame: `frame` at the end of the list; fails when the last one is incomplete.
+    func add_frame(frame: DemuxFrame) -> !:
+        if self.count > 0 and not self.frames[self.count - 1].complete:
+            error(corrupt, "WebP frame follows an incomplete one")
+        if self.count == self.frames.length:
+            let larger = try new DemuxFrame[self.count * 2 + 4] in memory.heap
+            memory.copy(larger, self.frames, self.count)
+            self.release()
+            self.frames = larger
+        self.frames[self.count] = frame
+        self.count += 1
+
+    ## StoreFrame: the ALPH and VP8 or VP8L chunks of frame `frame_num` into `frame`, up to
+    ## the first other chunk; `min_size` is the bytes the frame needs at least.
+    func store_frame(frame_num: usize, min_size: usize, frame: DemuxFrame*) -> Parse:
+        var alpha_chunks = 0
+        var image_chunks = 0
+        if self.left() < chunk_header_size or self.left() < min_size:
+            return Parse.need_more_data
+        var status = Parse.ok
+        var done = false
+        while not done and status == Parse.ok:
+            let chunk_start_offset = self.start
+            let fourcc_at = self.start
+            self.start += 4
+            let payload_size = (u64)self.read_le32()
+            if payload_size > max_chunk_payload:
+                return Parse.error
+            let payload_size_padded = payload_size + (payload_size & 1)
+            let payload_available = (usize)payload_size_padded if payload_size_padded <= (u64)self.left() else self.left()
+            let chunk_size = chunk_header_size + payload_available
+            if self.size_is_invalid(payload_size_padded):
+                return Parse.error
+            if payload_size_padded > (u64)self.left():
+                status = Parse.need_more_data
+            if holds(self.data, fourcc_at, "ALPH") and alpha_chunks == 0:
+                alpha_chunks += 1
+                frame.alpha_offset = chunk_start_offset
+                frame.alpha_size = chunk_size
+                frame.has_alpha = true
+                frame.frame_num = frame_num
+                self.start += payload_available
+            elif holds(self.data, fourcc_at, "VP8L") and alpha_chunks > 0:
+                # VP8L has its own alpha.
+                return Parse.error
+            elif (holds(self.data, fourcc_at, "VP8L") or holds(self.data, fourcc_at, "VP8 ")) and image_chunks == 0:
+                # The bitstream's features, a failure tolerated when the data is
+                # incomplete.
+                var headers: Headers = ---
+                let vp8_status = parse_headers(self.data[chunk_start_offset..<chunk_start_offset + chunk_size], false, false, &headers)
+                if status == Parse.need_more_data and vp8_status == Status.not_enough_data:
+                    return Parse.need_more_data
+                if vp8_status != Status.ok:
+                    return Parse.error
+                image_chunks += 1
+                # SetFrameInfo.
+                frame.image_offset = chunk_start_offset
+                frame.image_size = chunk_size
+                frame.width = headers.width
+                frame.height = headers.height
+                frame.has_alpha = frame.has_alpha or headers.alpha
+                frame.frame_num = frame_num
+                frame.complete = status == Parse.ok
+                self.start += payload_available
+            else:
+                # Another chunk: back up to its header, for the level above.
+                self.start -= chunk_header_size
+                done = true
+            if self.start == self.riff_end:
+                done = true
+            elif self.left() < chunk_header_size:
+                status = Parse.need_more_data
+        return status
+
+    ## ParseSingleImage: a still image's chunks.
+    func parse_single_image() -> Parse!:
+        if self.count > 0:
+            return Parse.error
+        if self.size_is_invalid((u64)chunk_header_size):
+            return Parse.error
+        if self.left() < chunk_header_size:
+            return Parse.need_more_data
+        var frame = DemuxFrame()
+        let status = self.store_frame(1, 0, &frame)
+        if status != Parse.error:
+            # No alpha without the alpha flag.
+            if (self.feature_flags & alpha_flag) == 0 and frame.alpha_size > 0:
+                frame.alpha_offset = 0
+                frame.alpha_size = 0
+                frame.has_alpha = false
+            # A simple file's canvas is its image.
+            if not self.is_ext_format and frame.width > 0 and frame.height > 0:
+                self.parsed_header = true
+                self.canvas_width = (i64)frame.width
+                self.canvas_height = (i64)frame.height
+                if frame.has_alpha:
+                    self.feature_flags |= alpha_flag
+            try self.add_frame(frame)
+        return status
+
+    ## ParseAnimationFrame: an ANMF chunk of `frame_chunk_size` padded bytes and the image
+    ## chunks after its header.
+    func parse_animation_frame(frame_chunk_size: usize) -> Parse!:
+        let is_animation = (self.feature_flags & animation_flag) != 0
+        # NewFrame.
+        if self.size_is_invalid((u64)anmf_chunk_size) or frame_chunk_size < anmf_chunk_size:
+            return Parse.error
+        if self.left() < anmf_chunk_size:
+            return Parse.need_more_data
+        let anmf_payload_size = frame_chunk_size - anmf_chunk_size
+        var frame = DemuxFrame()
+        frame.x_offset = 2 * (usize)self.read_le24()
+        frame.y_offset = 2 * (usize)self.read_le24()
+        frame.width = 1 + (usize)self.read_le24()
+        frame.height = 1 + (usize)self.read_le24()
+        frame.duration = self.read_le24()
+        let bits = self.read_byte()
+        frame.dispose_background = (bits & 1) != 0
+        frame.blend = (bits & 2) == 0
+        if (u64)frame.width * (u64)frame.height >= max_image_area:
+            return Parse.error
+        # A frame is kept when the animation flag is set and some of its data is there.
+        let start_offset = self.start
+        var status = self.store_frame(self.count + 1, anmf_payload_size, &frame)
+        if status != Parse.error and self.start - start_offset > anmf_payload_size:
+            status = Parse.error
+        if status != Parse.error and is_animation and frame.frame_num > 0:
+            try self.add_frame(frame)
+        return status
+
+    ## ParseVP8X: the VP8X chunk, then the chunks after it.
+    func parse_vp8x() -> Parse!:
+        if self.left() < chunk_header_size:
+            return Parse.need_more_data
+        self.is_ext_format = true
+        self.start += tag_size
+        var vp8x_size = (u64)self.read_le32()
+        if vp8x_size > max_chunk_payload or vp8x_size < (u64)vp8x_chunk_size:
+            return Parse.error
+        vp8x_size += vp8x_size & 1
+        if self.size_is_invalid(vp8x_size):
+            return Parse.error
+        if (u64)self.left() < vp8x_size:
+            return Parse.need_more_data
+        self.feature_flags = self.read_byte()
+        # Reserved.
+        self.start += 3
+        self.canvas_width = 1 + (i64)self.read_le24()
+        self.canvas_height = 1 + (i64)self.read_le24()
+        if (u64)self.canvas_width * (u64)self.canvas_height >= max_image_area:
+            return Parse.error
+        # Any trailing data.
+        self.start += (usize)vp8x_size - vp8x_chunk_size
+        self.parsed_header = true
+        if self.size_is_invalid((u64)chunk_header_size):
+            return Parse.error
+        if self.left() < chunk_header_size:
+            return Parse.need_more_data
+        return try self.parse_vp8x_chunks()
+
+    ## ParseVP8XChunks: the chunks after the VP8X chunk.
+    func parse_vp8x_chunks() -> Parse!:
+        let is_animation = (self.feature_flags & animation_flag) != 0
+        var anim_chunks = 0
+        var status = Parse.ok
+        while true:
+            let fourcc_at = self.start
+            self.start += 4
+            let chunk_size = (u64)self.read_le32()
+            if chunk_size > max_chunk_payload:
+                return Parse.error
+            let chunk_size_padded = chunk_size + (chunk_size & 1)
+            if self.size_is_invalid(chunk_size_padded):
+                return Parse.error
+            if holds(self.data, fourcc_at, "VP8X"):
+                return Parse.error
+            elif holds(self.data, fourcc_at, "ALPH") or holds(self.data, fourcc_at, "VP8 ") or holds(self.data, fourcc_at, "VP8L"):
+                # Not an animation: all its frames are in ANMF chunks.
+                if anim_chunks > 0 or is_animation:
+                    return Parse.error
+                self.start -= chunk_header_size
+                status = try self.parse_single_image()
+            elif holds(self.data, fourcc_at, "ANIM"):
+                if chunk_size_padded < (u64)anim_chunk_size:
+                    return Parse.error
+                if (u64)self.left() < chunk_size_padded:
+                    status = Parse.need_more_data
+                elif anim_chunks == 0:
+                    anim_chunks += 1
+                    self.background = self.read_le32()
+                    self.loop_count = self.read_le16()
+                    self.start += (usize)chunk_size_padded - anim_chunk_size
+                else:
+                    # A second ANIM chunk is skipped.
+                    self.start += (usize)chunk_size_padded
+            elif holds(self.data, fourcc_at, "ANMF"):
+                # ANIM comes before the frames.
+                if anim_chunks == 0:
+                    return Parse.error
+                status = try self.parse_animation_frame((usize)chunk_size_padded)
+            else:
+                # Skipped: ICCP, EXIF, XMP, a second ANIM, unknown chunks.
+                if chunk_size_padded <= (u64)self.left():
+                    self.start += (usize)chunk_size_padded
+                else:
+                    status = Parse.need_more_data
+            if self.start == self.riff_end:
+                break
+            elif self.left() < chunk_header_size:
+                status = Parse.need_more_data
+            if status != Parse.ok:
+                break
+        return status
+
+    # mark: Validation ========================================================================
+
+    ## IsValidSimpleFormat.
+    func valid_simple() -> bool:
+        if not self.parsed_header:
+            return true
+        if self.canvas_width <= 0 or self.canvas_height <= 0:
+            return false
+        if self.done and self.count == 0:
+            return false
+        if self.count == 0:
+            return true
+        let frame = self.frames[0]
+        return frame.width > 0 and frame.height > 0
+
+    ## IsValidExtendedFormat.
+    func valid_extended() -> bool:
+        let is_animation = (self.feature_flags & animation_flag) != 0
+        if not self.parsed_header:
+            return true
+        if self.canvas_width <= 0 or self.canvas_height <= 0:
+            return false
+        if self.done and self.count == 0:
+            return false
+        if (self.feature_flags & ~all_valid_flags) != 0:
+            return false
+        for f in self.frames[..<self.count]:
+            if not is_animation and f.frame_num > 1:
+                return false
+            if f.complete:
+                if f.alpha_size == 0 and f.image_size == 0:
+                    return false
+                # Alpha before the image.
+                if f.alpha_size > 0 and f.alpha_offset > f.image_offset:
+                    return false
+                if f.width == 0 or f.height == 0:
+                    return false
+            else:
+                # No partial frame: partial files are refused.
+                return false
+            if f.width > 0 and f.height > 0 and not self.check_frame_bounds(f, not is_animation):
+                return false
+        return true
+
+    ## CheckFrameBounds: exactly the canvas for a still image, within it for a frame.
+    func check_frame_bounds(frame: DemuxFrame, exact: bool) -> bool:
+        if exact:
+            return frame.x_offset == 0 and frame.y_offset == 0 and (i64)frame.width == self.canvas_width and (i64)frame.height == self.canvas_height
+        return (i64)(frame.width + frame.x_offset) <= self.canvas_width and (i64)(frame.height + frame.y_offset) <= self.canvas_height

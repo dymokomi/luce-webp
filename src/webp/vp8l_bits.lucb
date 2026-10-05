@@ -1,0 +1,86 @@
+#==============================================================================================
+#
+#   webp/vp8l_bits - VP8L's bit reader
+#
+#   DESCRIPTION:
+#       Port of utils/bit_reader_utils.c's VP8LBitReader, least significant bit first,
+#       with libwebp's fast 32-bit refill (VP8L_USE_FAST_LOAD, as on x86-64 and arm64):
+#       `val` holds 64 bits and `bit_pos` how many of them are consumed. When the data is
+#       exhausted the reader sets `eos`; the decoder checks it where libwebp does, since
+#       the moment it is set decides whether a stream that ends exactly at its last bit
+#       is accepted.
+#
+#==============================================================================================
+
+## The most bits one read may take (VP8L_MAX_NUM_BIT_READ), and the masks of 0..24 bits.
+let max_num_bit_read: u32 = 24
+let bit_masks: u32[25] = [0, 0x000001, 0x000003, 0x000007, 0x00000f, 0x00001f, 0x00003f, 0x00007f, 0x0000ff, 0x0001ff, 0x0003ff, 0x0007ff, 0x000fff, 0x001fff, 0x003fff, 0x007fff, 0x00ffff, 0x01ffff, 0x03ffff, 0x07ffff, 0x0fffff, 0x1fffff, 0x3fffff, 0x7fffff,
+                          0xffffff]
+
+## A VP8L bit reader (VP8LBitReader).
+struct LosslessBits:
+    ## The prefetched bits.
+    var val: u64
+    var buf: const u8[]
+    ## The next byte to load.
+    var pos: usize
+    ## Bits of `val` consumed.
+    var bit_pos: u32
+    ## Whether a bit was read past the end.
+    var eos: bool
+
+    ## A reader over `data` (VP8LInitBitReader).
+    static func start(data: const u8[]) -> LosslessBits:
+        var value: u64 = 0
+        let length = data.length if data.length < 8 else 8
+        for i in 0..<length:
+            value |= (u64)data[i] << (8 * (u64)i)
+        return LosslessBits(val = value, buf = data, pos = length, bit_pos = 0, eos = false)
+
+    ## VP8LPrefetchBits: the next 32 bits, the low ones first.
+    inline func prefetch_bits() -> u32:
+        return (u32)(self.val >> ((u64)self.bit_pos & 63))
+
+    ## VP8LIsEndOfStream.
+    inline func is_end_of_stream() -> bool:
+        return self.eos or (self.pos == self.buf.length and self.bit_pos > 64)
+
+    ## VP8LSetEndOfStream.
+    func set_end_of_stream():
+        self.eos = true
+        self.bit_pos = 0
+
+    ## ShiftBytes: reload byte by byte while bytes are left.
+    func shift_bytes():
+        while self.bit_pos >= 8 and self.pos < self.buf.length:
+            self.val >>= 8
+            self.val |= (u64)self.buf[self.pos] << 56
+            self.pos += 1
+            self.bit_pos -= 8
+        if self.is_end_of_stream():
+            self.set_end_of_stream()
+
+    ## VP8LFillBitWindow: keep at least 32 bits ready.
+    inline func fill_bit_window():
+        if self.bit_pos >= 32:
+            self.do_fill_bit_window()
+
+    ## VP8LDoFillBitWindow: 32 bits at once while eight bytes are left.
+    inline func do_fill_bit_window():
+        if self.pos +% 8 < self.buf.length:
+            let p = self.buf.data + self.pos
+            self.val = (self.val >> 32) | (((u64)p[0] | ((u64)p[1] << 8) | ((u64)p[2] << 16) | ((u64)p[3] << 24)) << 32)
+            self.bit_pos = self.bit_pos -% 32
+            self.pos = self.pos +% 4
+            return
+        self.shift_bytes()
+
+    ## VP8LReadBits: `n_bits` bits (at most 24); 0 and the end of the stream past it.
+    func read_bits(n_bits: u32) -> u32:
+        if not self.eos and n_bits <= max_num_bit_read:
+            let val = self.prefetch_bits() & bit_masks[(usize)n_bits]
+            self.bit_pos += n_bits
+            self.shift_bytes()
+            return val
+        self.set_end_of_stream()
+        return 0

@@ -1,0 +1,280 @@
+#==============================================================================================
+#
+#   webp/vp8_frame - The VP8 decoder's frame: memory, rows, reconstruction
+#
+#   DESCRIPTION:
+#       Port of dec/frame_dec.c with one cache row (libwebp's single-threaded layout) and
+#       of VP8Decode's main loop (vp8_dec.c ParseFrame). Each macroblock row is parsed
+#       (modes from partition 0, coefficients from its token partition), reconstructed in
+#       the 32-byte-stride work area (prediction plus residuals) and copied into the row
+#       cache, loop-filtered there, and handed to the output (vp8_output) as far as the
+#       filter allows: the filter still changes the last rows of a row until the next is
+#       decoded, so those rows (kFilterExtraRows) wait above the cache and go out with the
+#       next row.
+#
+#==============================================================================================
+
+# mark: Memory ================================================================================
+
+## How many rows the loop filter can still change below a row (kFilterExtraRows):
+## none, two for the simple filter, eight for the complex one.
+let filter_extra_rows: usize[3] = [0, 2, 8]
+
+## A frame's working memory (AllocateMemory), on the heap, and where its rows go.
+struct FrameBuffers:
+    ## The 4x4 modes of the row above (4 a macroblock) and of the macroblock to the left.
+    var intra_t: u8[]
+    var intra_l: u8[4]
+    ## The bottom samples of each macroblock of the row above: 16 Y, 8 U, 8 V.
+    var yuv_t: u8[]
+    ## The non-zero contexts: the left macroblock's first, then the row above's.
+    var mb_info: MacroblockContext[]
+    var f_info: FilterInfo[]
+    ## The prediction work area.
+    var yuv_b: u8[]
+    var mb_data: MacroblockData[]
+    ## The row cache: Y, U and V, each with its filter's extra rows above.
+    var cache: u8[]
+    var cache_y: u8*
+    var cache_u: u8*
+    var cache_v: u8*
+    var cache_y_stride: usize
+    var cache_uv_stride: usize
+    var output: Output
+
+    ## The memory of `dec`'s frame, its rows going to `area`.
+    static func allocate(dec: const Vp8*, area: Area, alpha: Alpha) -> FrameBuffers!:
+        let mb_w = dec.mb_w
+        let extra_rows = filter_extra_rows[(usize)dec.filter_type]
+        let y_stride = 16 * mb_w
+        let uv_stride = 8 * mb_w
+        let extra_y = extra_rows * y_stride
+        let extra_uv = (extra_rows // 2) * uv_stride
+        let cache = try new u8[extra_y + 16 * y_stride + 2 * (extra_uv + 8 * uv_stride)] in memory.heap
+        errdefer free(cache) in memory.heap
+        let cache_y = cache.data + extra_y
+        let cache_u = cache_y + 16 * y_stride + extra_uv
+        let cache_v = cache_u + 8 * uv_stride + extra_uv
+        var fb = FrameBuffers(intra_t = try new u8[4 * mb_w] in memory.heap, yuv_t = try new u8[32 * mb_w] in memory.heap, mb_info = try new MacroblockContext[mb_w + 1] in memory.heap, f_info = try new FilterInfo[mb_w] in memory.heap,
+                              yuv_b = try new u8[yuv_size] in memory.heap, mb_data = try new MacroblockData[mb_w] in memory.heap, cache = cache, cache_y = cache_y, cache_u = cache_u, cache_v = cache_v, cache_y_stride = y_stride,
+                              cache_uv_stride = uv_stride, output = try Output.start(dec, area, alpha))
+        init_scanline(&fb)
+        fill_bytes(fb.intra_t.data, b_dc_pred, fb.intra_t.length)
+        return fb
+
+    ## Free the memory.
+    func release():
+        free(self.intra_t) in memory.heap
+        free(self.yuv_t) in memory.heap
+        free(self.mb_info) in memory.heap
+        free(self.f_info) in memory.heap
+        free(self.yuv_b) in memory.heap
+        free(self.mb_data) in memory.heap
+        free(self.cache) in memory.heap
+        self.output.release()
+
+# mark: Reconstruction ========================================================================
+
+## The work area offset of each 4x4 luma block (kScan).
+let scan: u16[16] = [0, 4, 8, 12, 128, 132, 136, 140, 256, 260, 264, 268, 384, 388, 392, 396]
+
+## CheckMode: a DC mode at the picture's top or left edge uses what it has.
+func check_mode(mb_x: usize, mb_y: usize, mode: u8) -> u8:
+    if mode == b_dc_pred:
+        if mb_x == 0:
+            return b_dc_pred_notopleft if mb_y == 0 else b_dc_pred_noleft
+        return b_dc_pred_notop if mb_y == 0 else b_dc_pred
+    return mode
+
+## DoTransform: a luma block's residuals by the two bits at the top of `bits`.
+inline func do_transform(bits: u32, src: const i16*, dst: u8*):
+    match bits >> 30:
+        3:
+            transform_one(src, dst)
+        2:
+            transform_ac3(src, dst)
+        1:
+            transform_dc(src, dst)
+        _:
+            return
+
+## DoUVTransform: a chroma block's residuals by its eight bits of `bits`.
+func do_uv_transform(bits: u32, src: const i16*, dst: u8*):
+    if (bits & 0xff) != 0:
+        # Any AC coefficient?
+        if (bits & 0xaa) != 0:
+            transform_uv(src, dst)
+        else:
+            transform_dc_uv(src, dst)
+
+## ReconstructRow: predict and add the residuals of macroblock row `mb_y`, into the row
+## cache.
+func reconstruct_row(dec: const Vp8*, fb: FrameBuffers*, mb_y: usize):
+    let y_dst = fb.yuv_b.data + y_off
+    let u_dst = fb.yuv_b.data + u_off
+    let v_dst = fb.yuv_b.data + v_off
+    # The left-most block's left samples.
+    for j in 0..<(usize)16:
+        (y_dst - 1)[j * bps] = 129
+    for j in 0..<(usize)8:
+        (u_dst - 1)[j * bps] = 129
+        (v_dst - 1)[j * bps] = 129
+    # The top-left sample, on the left column too.
+    if mb_y > 0:
+        (y_dst - bps - 1)[0] = 129
+        (u_dst - bps - 1)[0] = 129
+        (v_dst - bps - 1)[0] = 129
+    else:
+        # Done once at block (0,0); it stays valid for the whole top row.
+        fill_bytes(y_dst - bps - 1, 127, 16 + 4 + 1)
+        fill_bytes(u_dst - bps - 1, 127, 8 + 1)
+        fill_bytes(v_dst - bps - 1, 127, 8 + 1)
+    for mb_x in 0..<dec.mb_w:
+        let block = &fb.mb_data[mb_x]
+        # Rotate in the left samples of the block before, four at a time (the in-loop
+        # filter needs them).
+        if mb_x > 0:
+            for j in 0..<(usize)17:
+                copy_bytes(y_dst + j * bps - bps - 4, y_dst + j * bps - bps + 12, 4)
+            for j in 0..<(usize)9:
+                copy_bytes(u_dst + j * bps - bps - 4, u_dst + j * bps - bps + 4, 4)
+                copy_bytes(v_dst + j * bps - bps - 4, v_dst + j * bps - bps + 4, 4)
+        # The top samples into the work area.
+        let top_yuv = fb.yuv_t.data + mb_x * 32
+        let coeffs = &block.coeffs[0]
+        var bits = block.non_zero_y
+        if mb_y > 0:
+            copy_bytes(y_dst - bps, top_yuv, 16)
+            copy_bytes(u_dst - bps, top_yuv + 16, 8)
+            copy_bytes(v_dst - bps, top_yuv + 24, 8)
+        # Predict and add the residuals.
+        if block.is_i4x4:
+            let top_right = y_dst - bps + 16
+            if mb_y > 0:
+                if mb_x >= dec.mb_w - 1:
+                    # On the right border.
+                    fill_bytes(top_right, top_yuv[15], 4)
+                else:
+                    copy_bytes(top_right, top_yuv + 32, 4)
+            # The top-right samples replicated below.
+            copy_bytes(top_right + 4 * bps, top_right, 4)
+            copy_bytes(top_right + 8 * bps, top_right, 4)
+            copy_bytes(top_right + 12 * bps, top_right, 4)
+            for n in 0..<(usize)16:
+                let dst = y_dst + (usize)scan[n]
+                predict_luma4(block.imodes[n], dst)
+                do_transform(bits, coeffs + n * 16, dst)
+                bits <<= 2
+        else:
+            predict_luma16(check_mode(mb_x, mb_y, block.imodes[0]), y_dst)
+            if bits != 0:
+                for n in 0..<(usize)16:
+                    do_transform(bits, coeffs + n * 16, y_dst + (usize)scan[n])
+                    bits <<= 2
+        # Chroma.
+        let bits_uv = block.non_zero_uv
+        let uv_mode = check_mode(mb_x, mb_y, block.uvmode)
+        predict_chroma8(uv_mode, u_dst)
+        predict_chroma8(uv_mode, v_dst)
+        do_uv_transform(bits_uv, coeffs + 16 * 16, u_dst)
+        do_uv_transform(bits_uv >> 8, coeffs + 20 * 16, v_dst)
+        # Keep the bottom samples for the next row.
+        if mb_y < dec.mb_h - 1:
+            copy_bytes(top_yuv, y_dst + 15 * bps, 16)
+            copy_bytes(top_yuv + 16, u_dst + 7 * bps, 8)
+            copy_bytes(top_yuv + 24, v_dst + 7 * bps, 8)
+        # The reconstructed samples into the row cache.
+        let y_out = fb.cache_y + mb_x * 16
+        let u_out = fb.cache_u + mb_x * 8
+        let v_out = fb.cache_v + mb_x * 8
+        for j in 0..<(usize)16:
+            copy_bytes(y_out + j * fb.cache_y_stride, y_dst + j * bps, 16)
+        for j in 0..<(usize)8:
+            copy_bytes(u_out + j * fb.cache_uv_stride, u_dst + j * bps, 8)
+            copy_bytes(v_out + j * fb.cache_uv_stride, v_dst + j * bps, 8)
+
+# mark: Rows ==================================================================================
+
+## FinishRow: filter row `mb_y` and hand on the rows the filter is done with; the rows it
+## may still change rotate above the cache for the next row.
+func finish_row(dec: const Vp8*, fb: FrameBuffers*, mb_y: usize, filter_row: bool) -> !:
+    let extra_y_rows = filter_extra_rows[(usize)dec.filter_type]
+    let ysize = extra_y_rows * fb.cache_y_stride
+    let uvsize = (extra_y_rows // 2) * fb.cache_uv_stride
+    let ydst = fb.cache_y - ysize
+    let udst = fb.cache_u - uvsize
+    let vdst = fb.cache_v - uvsize
+    let is_first_row = mb_y == 0
+    let is_last_row = mb_y >= dec.br_mb_y - 1
+    if filter_row:
+        filter_macroblock_row(dec, fb, mb_y)
+    var y_start = mb_y * 16
+    var y_end = (mb_y + 1) * 16
+    var rows = Rows(y = fb.cache_y, u = fb.cache_u, v = fb.cache_v)
+    if not is_first_row:
+        y_start -= extra_y_rows
+        rows = Rows(y = ydst, u = udst, v = vdst)
+    if not is_last_row:
+        y_end -= extra_y_rows
+    if y_end > dec.height:
+        y_end = dec.height
+    if y_start < y_end:
+        try fb.output.put(dec, fb, rows, y_start, y_end - y_start)
+    # Rotate the rows the filter may still change.
+    if not is_last_row:
+        copy_bytes(fb.cache_y - ysize, ydst + 16 * fb.cache_y_stride, ysize)
+        copy_bytes(fb.cache_u - uvsize, udst + 8 * fb.cache_uv_stride, uvsize)
+        copy_bytes(fb.cache_v - uvsize, vdst + 8 * fb.cache_uv_stride, uvsize)
+
+## Where a call's rows start in the cache, Y, U and V.
+struct Rows:
+    var y: const u8*
+    var u: const u8*
+    var v: const u8*
+
+# mark: Decoding ==============================================================================
+
+## VP8EnterCritical's bounds: every macroblock is filtered from the top left, and decoded
+## up to the picture's bottom right and the rows the filter reaches below it.
+func set_bounds(dec: Vp8*):
+    let extra_pixels = filter_extra_rows[(usize)dec.filter_type]
+    if dec.filter_type == 2:
+        # The complex filter's dependency chain goes back to macroblock 0.
+        dec.tl_mb_x = 0
+        dec.tl_mb_y = 0
+    else:
+        # The simple filter: no cropping, so from the top left as well.
+        dec.tl_mb_x = 0
+        dec.tl_mb_y = 0
+    dec.br_mb_y = (dec.height + 15 + extra_pixels) >> 4
+    dec.br_mb_x = (dec.width + 15 + extra_pixels) >> 4
+    if dec.br_mb_x > dec.mb_w:
+        dec.br_mb_x = dec.mb_w
+    if dec.br_mb_y > dec.mb_h:
+        dec.br_mb_y = dec.mb_h
+    precompute_filter_strengths(dec)
+
+## ParseFrame: every macroblock row parsed, reconstructed, filtered and handed on.
+func parse_frame(dec: Vp8*, fb: FrameBuffers*) -> !:
+    for mb_y in 0..<dec.br_mb_y:
+        let token_br = &dec.parts[mb_y & dec.num_parts_minus_one]
+        if not parse_intra_mode_row(dec, fb):
+            error(corrupt, "VP8 partition 0 ends early")
+        for mb_x in 0..<dec.mb_w:
+            if not decode_macroblock(dec, fb, mb_x, token_br):
+                error(corrupt, "VP8 data ends early")
+        init_scanline(fb)
+        # Reconstruct, filter and emit the row.
+        let filter_row = dec.filter_type > 0 and mb_y >= dec.tl_mb_y and mb_y <= dec.br_mb_y
+        reconstruct_row(dec, fb, mb_y)
+        try finish_row(dec, fb, mb_y, filter_row)
+
+## VP8Decode: the VP8 bitstream `data` into `area`, with the alpha plane of `alpha`.
+func decode_vp8(data: const u8[], area: Area, alpha: Alpha) -> !:
+    var dec: Vp8
+    try get_headers(&dec, data)
+    try check_area(area, dec.width, dec.height)
+    set_bounds(&dec)
+    var fb = try FrameBuffers.allocate(&dec, area, alpha)
+    defer fb.release()
+    try parse_frame(&dec, &fb)

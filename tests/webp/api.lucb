@@ -1,0 +1,142 @@
+#==============================================================================================
+#
+#   tests/webp/api - The public API: features, errors, animations, the ICC profile
+#
+#==============================================================================================
+
+test "features and info read headers; info walks an animation's frames":
+    let still = try fixture("ladybird/extended-lossless.webp")
+    defer free(still) in memory.heap
+    let found = try info(still)
+    assert(found.width == 417 and found.height == 223 and found.alpha and not found.animated)
+    assert(found.format == Format.lossless and found.frame_count == 1 and found.loop_count == 0)
+    let moving = try fixture("synthetic/anim-lossy.webp")
+    defer free(moving) in memory.heap
+    let headers = try features(moving)
+    assert(headers.animated and headers.format == Format.mixed and headers.frame_count == 1)
+    let walked = try info(moving)
+    assert(walked.frame_count == 5 and walked.loop_count == 0 and walked.plays() == 0)
+
+test "data that is not a WebP, or ends early, is corrupt":
+    var junk: u8[32]
+    for i in 0..<junk.length:
+        junk[i] = (u8)i
+    let failed = features(junk) catch failure:
+        assert(failure.code == corrupt)
+        recover Info()
+    assert(failed.width == 0)
+    let data = try fixture("ladybird/simple-vp8.webp")
+    defer free(data) in memory.heap
+    let found = try features(data)
+    let pixels = try new u8[found.width * found.height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    var refused = false
+    decode_rgba8(data[..<data.length - 100], pixels) catch failure:
+        refused = failure.code == corrupt
+    assert(refused)
+
+test "the output must hold the picture, and the canvas the limit":
+    let data = try fixture("ladybird/Qpalette.webp")
+    defer free(data) in memory.heap
+    var small: u8[16]
+    var code = corrupt
+    decode_rgba8(data, small) catch failure:
+        code = failure.code
+    assert(code == invalid)
+    let pixels = try new u8[256 * 256 * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    decode_rgba8(data, pixels, Options(max_pixels = 1000)) catch failure:
+        code = failure.code
+    assert(code == limit)
+
+test "decode_rgba8 gives an animation's first frame, composited":
+    let data = try fixture("synthetic/anim-mixed.webp")
+    defer free(data) in memory.heap
+    let found = try info(data)
+    let size = found.width * found.height * 4
+    let first = try new u8[size] in memory.heap
+    defer free(first) in memory.heap
+    try decode_rgba8(data, first)
+    var animation = try Animation.open(data)
+    defer animation.release()
+    let frame = try new u8[size] in memory.heap
+    defer free(frame) in memory.heap
+    try animation.render(0, frame)
+    for i in 0..<size:
+        assert(first[i] == frame[i])
+
+test "frames render in any order, the same as in order":
+    let data = try fixture("synthetic/gif-dispose_bgnd.webp")
+    defer free(data) in memory.heap
+    var animation = try Animation.open(data)
+    defer animation.release()
+    let count = animation.frames().length
+    assert(count > 2)
+    let size = animation.info.width * animation.info.height * 4
+    let in_order = try new u8[size * count] in memory.heap
+    defer free(in_order) in memory.heap
+    for index in 0..<count:
+        try animation.render(index, in_order[index * size..])
+    let again = try new u8[size] in memory.heap
+    defer free(again) in memory.heap
+    let order: usize[4] = [count - 1, 1, 0, count - 2]
+    for index in order:
+        try animation.render(index, again)
+        for i in 0..<size:
+            assert(again[i] == in_order[index * size + i])
+    var code = corrupt
+    animation.render(count, again) catch failure:
+        code = failure.code
+    assert(code == invalid)
+
+test "an animation's frames carry their rectangles, durations, disposal and blending":
+    let data = try fixture("synthetic/anim-lossless.webp")
+    defer free(data) in memory.heap
+    var animation = try Animation.open(data)
+    defer animation.release()
+    assert(animation.info.loop_count == 3 and animation.info.plays() == 3)
+    for (index, frame) in animation.frames().indexed():
+        # img2webp's -d 20, 40, ...
+        assert(frame.duration == 20 * ((u32)index + 1))
+        assert(frame.left + frame.width <= animation.info.width and frame.top + frame.height <= animation.info.height)
+
+test "a still picture opens as an animation of one frame":
+    let data = try fixture("ladybird/smolkling.webp")
+    defer free(data) in memory.heap
+    var animation = try Animation.open(data)
+    defer animation.release()
+    assert(animation.frames().length == 1 and not animation.info.animated)
+    let size: usize = 264 * 264 * 4
+    let a = try new u8[size] in memory.heap
+    defer free(a) in memory.heap
+    let b = try new u8[size] in memory.heap
+    defer free(b) in memory.heap
+    try animation.render(0, a)
+    try decode_rgba8(data, b)
+    for i in 0..<size:
+        assert(a[i] == b[i])
+
+test "the ICC profile is the ICCP chunk's payload, when the flags announce it":
+    let tagged = try fixture("ladybird/extended-lossless.webp")
+    defer free(tagged) in memory.heap
+    let profile = try icc_profile(tagged) else trap("the file has an ICC profile")
+    assert(profile.length == 4032)
+    # An ICC profile starts with its size, big-endian.
+    assert(((usize)profile[2] << 8 | (usize)profile[3]) == 4032)
+    let plain = try fixture("ladybird/simple-vp8.webp")
+    defer free(plain) in memory.heap
+    assert(try icc_profile(plain) == none)
+
+test "a file whose chunks the mux finds inconsistent has no readable profile":
+    # The alpha flag cleared on a file with an ALPH chunk: libwebp's decoder accepts it,
+    # its mux (and so a browser reading the profile) does not.
+    let data = try fixture("ladybird/extended-lossy.webp")
+    defer free(data) in memory.heap
+    let changed = try new u8[data.length] in memory.heap
+    defer free(changed) in memory.heap
+    memory.copy(changed, data, data.length)
+    changed[20] = changed[20] & ~(u8)0x10
+    var refused = false
+    _ = icc_profile(changed) catch failure:
+        refused = failure.code == corrupt
+    assert(refused)

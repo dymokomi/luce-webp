@@ -1,0 +1,241 @@
+#==============================================================================================
+#
+#   webp/animation - Frames composited one after another
+#
+#   DESCRIPTION:
+#       Port of demux/anim_decode.c (WebPAnimDecoder) in its straight RGBA mode, which
+#       Ladybird uses (as BGRA). An `Animation` holds the demuxer's frame list and two
+#       canvases: the frame being made, and the last one after its disposal. A key frame
+#       (the first, one that covers the canvas without blending or alpha, or one after a
+#       frame disposed to the background that covered the canvas or was a key frame)
+#       starts from a transparent canvas; any other starts from the disposed one. The frame
+#       is decoded into its rectangle, and where it blends, its pixels that are not opaque
+#       are blended over what was there (BlendPixelNonPremult). A frame disposed to the
+#       background clears its rectangle afterwards. The background color is not drawn: the
+#       canvas starts transparent, as in browsers.
+#
+#==============================================================================================
+
+# mark: Frames ================================================================================
+
+## What becomes of a frame's area before the next frame is drawn.
+pub enum Disposal:
+    ## It stays (WEBP_MUX_DISPOSE_NONE).
+    keep
+    ## It is cleared to transparent (WEBP_MUX_DISPOSE_BACKGROUND).
+    background
+
+## One frame of an animation: where it is drawn, for how long, and what happens to it after.
+pub struct Frame:
+    ## The frame's rectangle on the canvas: the ANMF chunk's offset, the image's size.
+    pub var left: usize
+    pub var top: usize
+    pub var width: usize
+    pub var height: usize
+    ## Milliseconds, as written (the demuxer's duration).
+    pub var duration: u32
+    pub var disposal: Disposal = Disposal.keep
+    ## Whether the frame is alpha-blended over the canvas, or replaces its rectangle.
+    pub var blend: bool
+    ## Whether the frame has alpha: an ALPH chunk, or a VP8L image with alpha.
+    pub var alpha: bool
+
+# mark: The animation =========================================================================
+
+## A WebP's frames, rendered as whole composited canvases (WebPAnimDecoder). `data` must
+## stay valid while the animation is in use; `release` frees what it holds.
+pub struct Animation:
+    ## The canvas size, alpha, frame count, loop count and background color.
+    pub var info: Info
+    var data: const u8[]
+    var frame_list: Frame[]
+    var demuxer: Demuxer
+    ## The frame being made, and the last frame after its disposal, each
+    ## `info.width * info.height` RGBA pixels.
+    var curr_frame: u8[]
+    var prev_frame_disposed: u8[]
+    ## The last frame decoded, and whether it was a key frame.
+    var prev: DemuxFrame
+    var prev_frame_was_keyframe: bool
+    ## The frame the next `render` decodes first.
+    var next: usize
+
+    ## An animation of the WebP in `data`: its features checked, its frames demuxed and its
+    ## canvases allocated (WebPAnimDecoderNew). A still picture is an animation of one
+    ## frame. Fails when the file is invalid or its canvas is over `options.max_pixels`.
+    pub static func open(data: const u8[], options: Options = Options()) -> Animation!:
+        # The bitstream is checked before anything is allocated.
+        var found = try features(data)
+        var demuxer = try Demuxer.open(data)
+        errdefer demuxer.release()
+        found.width = (usize)demuxer.canvas_width
+        found.height = (usize)demuxer.canvas_height
+        found.frame_count = demuxer.count
+        if found.animated:
+            found.loop_count = demuxer.loop_count
+            found.background = demuxer.background
+        try check_canvas(found.width, found.height, options)
+        let frames = try new Frame[demuxer.count] --- in memory.heap
+        errdefer free(frames) in memory.heap
+        for (index, frame) in demuxer.frame_list().indexed():
+            frames[index] = Frame(left = frame.x_offset, top = frame.y_offset, width = frame.width, height = frame.height, duration = frame.duration, disposal = Disposal.background if frame.dispose_background else Disposal.keep, blend = frame.blend, alpha = frame.has_alpha)
+        let size = found.width * found.height * 4
+        let curr_frame = try new u8[size] in memory.heap
+        errdefer free(curr_frame) in memory.heap
+        let prev_frame_disposed = try new u8[size] in memory.heap
+        return Animation(info = found, data = data, frame_list = frames, demuxer = demuxer, curr_frame = curr_frame, prev_frame_disposed = prev_frame_disposed)
+
+    ## The frames, in order.
+    pub func frames() -> const Frame[]:
+        return self.frame_list
+
+    ## Render frame `index` into `out`, `info.width * info.height * 4` bytes of straight
+    ## RGBA: the canvas with every frame up to it composited. Frames render fastest in
+    ## order; an earlier index starts again from the first (WebPAnimDecoderReset). Fails
+    ## for an index past the last frame, an `out` too small, or a frame that does not
+    ## decode.
+    pub func render(index: usize, out: u8[]) -> !:
+        if index >= self.frame_list.length:
+            error(invalid, "WebP frame index is past the last frame")
+        let size = self.curr_frame.length
+        if out.length < size:
+            error(invalid, "WebP output buffer is smaller than the picture")
+        if index < self.next:
+            # WebPAnimDecoderReset.
+            self.next = 0
+            self.prev = DemuxFrame()
+            self.prev_frame_was_keyframe = false
+        while self.next <= index:
+            try self.get_next()
+        memory.copy(out, self.curr_frame, size)
+
+    ## Free the frame list and the canvases.
+    pub func release():
+        self.demuxer.release()
+        if self.frame_list.length > 0:
+            free(self.frame_list) in memory.heap
+        if self.curr_frame.length > 0:
+            free(self.curr_frame) in memory.heap
+        if self.prev_frame_disposed.length > 0:
+            free(self.prev_frame_disposed) in memory.heap
+        var no_frames: Frame[]
+        var no_bytes: u8[]
+        self.frame_list = no_frames
+        self.curr_frame = no_bytes
+        self.prev_frame_disposed = no_bytes
+
+    # mark: Compositing =======================================================================
+
+    ## WebPAnimDecoderGetNext: the next frame decoded and composited into `curr_frame`.
+    func get_next() -> !:
+        let width = self.info.width
+        let iter = self.demuxer.frames[self.next]
+        let is_key_frame = self.is_key_frame(&iter)
+        if is_key_frame:
+            memory.set(self.curr_frame, 0)
+        else:
+            memory.copy(self.curr_frame, self.prev_frame_disposed, self.curr_frame.length)
+        # Decode the frame into its rectangle.
+        let stride = width * 4
+        let out_offset = iter.y_offset * stride + iter.x_offset * 4
+        if out_offset >= self.curr_frame.length:
+            error(corrupt, "WebP frame lies outside the canvas")
+        let room = self.curr_frame.length - out_offset
+        let area = Area(pixels = self.curr_frame.data + out_offset, stride = stride, size = iter.height * stride if iter.height * stride < room else room)
+        try decode_picture(iter.payload(self.demuxer.data), area)
+        # The pixels the frame left transparent, blended with the canvas before it.
+        if self.next > 0 and iter.blend and not is_key_frame:
+            let canvas = (u32*)self.curr_frame.data
+            let before = (const u32*)self.prev_frame_disposed.data
+            if not self.prev.dispose_background:
+                for y in 0..<iter.height:
+                    let offset = (iter.y_offset + y) * width + iter.x_offset
+                    blend_row(canvas + offset, before + offset, iter.width)
+            else:
+                # Within the previous frame's rectangle the canvas was cleared, so the
+                # blend is only outside it.
+                for y in 0..<iter.height:
+                    let canvas_y = iter.y_offset + y
+                    let ranges = find_blend_range_at_row(&iter, &self.prev, canvas_y)
+                    if ranges.width1 > 0:
+                        let offset1 = canvas_y * width + ranges.left1
+                        blend_row(canvas + offset1, before + offset1, ranges.width1)
+                    if ranges.width2 > 0:
+                        let offset2 = canvas_y * width + ranges.left2
+                        blend_row(canvas + offset2, before + offset2, ranges.width2)
+        # The frame becomes the previous one, disposed for the next.
+        self.prev = iter
+        self.prev_frame_was_keyframe = is_key_frame
+        memory.copy(self.prev_frame_disposed, self.curr_frame, self.curr_frame.length)
+        if iter.dispose_background:
+            for y in 0..<iter.height:
+                let row = ((iter.y_offset + y) * width + iter.x_offset) * 4
+                memory.set(self.prev_frame_disposed[row..<row + iter.width * 4], 0)
+        self.next += 1
+
+    ## IsKeyFrame.
+    func is_key_frame(curr: const DemuxFrame*) -> bool:
+        let canvas_width = self.info.width
+        let canvas_height = self.info.height
+        if curr.frame_num == 1:
+            return true
+        if (not curr.has_alpha or not curr.blend) and curr.width == canvas_width and curr.height == canvas_height:
+            return true
+        let prev = &self.prev
+        return prev.dispose_background and ((prev.width == canvas_width and prev.height == canvas_height) or self.prev_frame_was_keyframe)
+
+## The parts of a row of the frame outside the previous frame's rectangle: up to two
+## ranges, a width of 0 for none.
+struct BlendRanges:
+    var left1: usize
+    var width1: usize
+    var left2: usize
+    var width2: usize
+
+## FindBlendRangeAtRow: the ranges of row `canvas_y` of `src` that are not in `dst`.
+func find_blend_range_at_row(src: const DemuxFrame*, dst: const DemuxFrame*, canvas_y: usize) -> BlendRanges:
+    let src_max_x = src.x_offset + src.width
+    let dst_max_x = dst.x_offset + dst.width
+    let dst_max_y = dst.y_offset + dst.height
+    var ranges = BlendRanges()
+    if canvas_y < dst.y_offset or canvas_y >= dst_max_y or src.x_offset >= dst_max_x or src_max_x <= dst.x_offset:
+        ranges.left1 = src.x_offset
+        ranges.width1 = src.width
+        return ranges
+    if src.x_offset < dst.x_offset:
+        ranges.left1 = src.x_offset
+        ranges.width1 = dst.x_offset - src.x_offset
+    if src_max_x > dst_max_x:
+        ranges.left2 = dst_max_x
+        ranges.width2 = src_max_x - dst_max_x
+    return ranges
+
+## BlendChannelNonPremult: one channel of `src` over `dst`, at bit `shift`.
+inline func blend_channel(src: u32, src_a: u32, dst: u32, dst_a: u32, scale: u32, shift: u32) -> u32:
+    let src_channel = (src >> shift) & 0xff
+    let dst_channel = (dst >> shift) & 0xff
+    let blend_unscaled = src_channel * src_a + dst_channel * dst_a
+    return (blend_unscaled * scale) >> 24
+
+## BlendPixelNonPremult: straight `src` over straight `dst`, in libwebp's integer
+## approximation of the formula.
+inline func blend_pixel(src: u32, dst: u32) -> u32:
+    let src_a = (src >> 24) & 0xff
+    if src_a == 0:
+        return dst
+    let dst_a = (dst >> 24) & 0xff
+    # dst_factor_a = (dst_a * (255 - src_a)) / 255, approximately.
+    let dst_factor_a = (dst_a * (256 - src_a)) >> 8
+    let blend_a = (src_a + dst_factor_a) & 0xff
+    let scale = ((u32)1 << 24) // blend_a
+    let blend_r = blend_channel(src, src_a, dst, dst_factor_a, scale, 0)
+    let blend_g = blend_channel(src, src_a, dst, dst_factor_a, scale, 8)
+    let blend_b = blend_channel(src, src_a, dst, dst_factor_a, scale, 16)
+    return (blend_r & 0xff) | ((blend_g & 0xff) << 8) | ((blend_b & 0xff) << 16) | (blend_a << 24)
+
+## BlendPixelRowNonPremult: the pixels of `src` that are not opaque, over `dst`.
+func blend_row(src: u32*, dst: const u32*, num_pixels: usize):
+    for i in 0..<num_pixels:
+        let src_alpha = (src[i] >> 24) & 0xff
+        if src_alpha != 0xff:
+            src[i] = blend_pixel(src[i], dst[i])

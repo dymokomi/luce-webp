@@ -1,0 +1,126 @@
+#==============================================================================================
+#
+#   webp/vp8_bits - VP8's boolean decoder
+#
+#   DESCRIPTION:
+#       Port of utils/bit_reader_utils.c and bit_reader_inl_utils.h (VP8BitReader), with
+#       the 64-bit layout libwebp uses on x86-64 and arm64 (BITS = 56): `value` holds the
+#       bits not yet consumed, refilled seven bytes at a time while eight remain, then a
+#       byte at a time. Reading past the end shifts in zeros once and sets `eof`; the
+#       decoder treats that as the data ending early, as libwebp does.
+#
+#==============================================================================================
+
+## Bits loaded at a time while the buffer has eight bytes left (BITS).
+let bits_at_once: i32 = 56
+
+## The shift that brings a range of 1..255 back to 128..255: 7 - floor(log2(range)).
+let range_shift: u8[256] = [
+    7, 7, 6, 6, 5, 5, 5, 5, 4, 4, 4, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
+## A boolean decoder over one partition (VP8BitReader).
+struct BoolReader:
+    ## The bits not yet consumed: the top `bits + 8` of them are the current window.
+    var value: u64
+    ## The current range minus one, in 127..254.
+    var range: u32
+    ## How many bits of `value` are left below the window; negative when it needs bytes.
+    var bits: i32
+    ## The partition, the next byte's position, and the last position a seven-byte load
+    ## may start at.
+    var data: const u8[]
+    var pos: usize
+    var max: usize
+    ## Whether the data ran out.
+    var eof: bool
+
+    ## A decoder over `data` (VP8InitBitReader).
+    static func start(data: const u8[]) -> BoolReader:
+        var br = BoolReader(value = 0, range = 255 - 1, bits = -8, data = data, pos = 0, max = data.length - 7 if data.length >= 8 else 0, eof = false)
+        br.load_new_bytes()
+        return br
+
+    ## VP8LoadNewBytes: refill `value` with seven bytes, or one near the end.
+    noinline func load_new_bytes():
+        if self.pos < self.max:
+            let p = self.data.data + self.pos
+            let bits = ((u64)p[0] << 48) | ((u64)p[1] << 40) | ((u64)p[2] << 32) | ((u64)p[3] << 24) | ((u64)p[4] << 16) | ((u64)p[5] << 8) | (u64)p[6]
+            self.pos += 7
+            self.value = bits | (self.value << 56)
+            self.bits += bits_at_once
+        else:
+            self.load_final_bytes()
+
+    ## VP8LoadFinalBytes: one byte at a time; past the end, zeros once, then nothing.
+    func load_final_bytes():
+        if self.pos < self.data.length:
+            self.bits += 8
+            self.value = (u64)self.data[self.pos] | (self.value << 8)
+            self.pos += 1
+        elif not self.eof:
+            self.value <<= 8
+            self.bits += 8
+            self.eof = true
+        else:
+            self.bits = 0
+
+    ## VP8GetBit: one bit whose probability of being 0 is `prob` / 256. The arithmetic
+    ## wraps where libwebp's cannot overflow (`range` < 256, `split` < `range`).
+    inline func get_bit(prob: u32) -> u32:
+        var range = self.range
+        if self.bits < 0:
+            self.load_new_bytes()
+        let pos = (u64)self.bits & 63
+        let split = (range *% prob) >> 8
+        let value = (u32)(self.value >> pos)
+        var bit: u32 = 0
+        if value > split:
+            range = range -% split
+            self.value = self.value -% ((u64)(split +% 1) << pos)
+            bit = 1
+        else:
+            range = split +% 1
+        let shifts: const u8* = &range_shift[0]
+        let shift = (u32)shifts[(usize)range] & 7
+        range = range << shift
+        self.bits = self.bits -% (i32)shift
+        self.range = range -% 1
+        return bit
+
+    ## VP8GetSigned: `v` or -`v`, by one bit of probability 1/2.
+    inline func get_signed(v: i32) -> i32:
+        if self.bits < 0:
+            self.load_new_bytes()
+        let pos = (u64)self.bits & 63
+        let split = self.range >> 1
+        let value = (u32)(self.value >> pos)
+        let mask = (i32)(split -% value) >> 31
+        self.bits = self.bits -% 1
+        self.range = (self.range +% (u32)mask) | 1
+        self.value = self.value -% ((u64)((split +% 1) & (u32)mask) << pos)
+        return (v ^ mask) -% mask
+
+    ## VP8GetValue: `count` bits, most significant first, each of probability 1/2.
+    func get_value(count: u32) -> u32:
+        var v: u32 = 0
+        var left = count
+        while left > 0:
+            left -= 1
+            v |= self.get_bit(0x80) << left
+        return v
+
+    ## VP8Get: one bit of probability 1/2, as a flag.
+    func get_flag() -> bool:
+        return self.get_value(1) != 0
+
+    ## VP8GetSignedValue: `count` bits of magnitude, then a sign bit.
+    func get_signed_value(count: u32) -> i32:
+        let value = (i32)self.get_value(count)
+        return -value if self.get_flag() else value

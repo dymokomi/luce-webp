@@ -1,0 +1,267 @@
+#==============================================================================================
+#
+#   webp/vp8_headers - The VP8 decoder and its headers
+#
+#   DESCRIPTION:
+#       Port of the header half of dec/vp8_dec.c (VP8GetHeaders: the frame tag, the key
+#       frame header, the segment and filter headers, the partitions), dec/quant_dec.c
+#       (VP8ParseQuant: the dequantization factors of each segment) and the probability
+#       half of dec/tree_dec.c (VP8ParseProba). The `Vp8` struct is VP8Decoder, decoding
+#       one key frame on the calling thread (libwebp's mt_method 0, which Ladybird's still
+#       pictures use; threads do not change the output).
+#
+#==============================================================================================
+
+# mark: The decoder ===========================================================================
+
+## Segment features (VP8SegmentHeader, paragraph 9.3).
+struct SegmentHeader:
+    var use_segment: bool
+    ## Whether the macroblocks carry a segment map.
+    var update_map: bool
+    ## Absolute values, or deltas from the frame's quantizer and filter level.
+    var absolute_delta: bool
+    var quantizer: i32[4]
+    var filter_strength: i32[4]
+
+## Loop filter parameters (VP8FilterHeader, paragraph 9.4).
+struct FilterHeader:
+    var simple: bool
+    ## 0..63.
+    var level: i32
+    ## 0..7.
+    var sharpness: i32
+    var use_lf_delta: bool
+    var ref_lf_delta: i32[4]
+    var mode_lf_delta: i32[4]
+
+## A segment's dequantization factors, DC and AC (VP8QuantMatrix).
+struct QuantMatrix:
+    var y1: i32[2]
+    var y2: i32[2]
+    var uv: i32[2]
+    ## The U/V quantizer (for dithering, which is off).
+    var uv_quant: i32
+
+## A macroblock's filter strengths (VP8FInfo).
+struct FilterInfo:
+    ## The edge limit, 3..189, or 0 for no filtering.
+    var limit: u8
+    ## The interior limit, 1..63.
+    var ilevel: u8
+    ## Whether the inner edges are filtered.
+    var inner: bool
+    ## The high edge variance threshold, 0..2.
+    var hev_thresh: u8
+
+## The contexts of a macroblock's neighbours for coefficient parsing (VP8MB): the non-zero
+## bits of its 4x4 luma and chroma blocks, and of its DC.
+struct MacroblockContext:
+    var nz: u8
+    var nz_dc: u8
+
+## What a macroblock needs for its reconstruction (VP8MBData).
+struct MacroblockData:
+    ## 384 coefficients: 16 luma, 4 U and 4 V blocks of 16.
+    var coeffs: i16[384]
+    var is_i4x4: bool
+    ## One 16x16 mode (the first) or sixteen 4x4 modes.
+    var imodes: u8[16]
+    var uvmode: u8
+    ## Two bits per 4x4 block, in decoding order: 0 no coefficient, 1 only DC, 2 the
+    ## first three, 3 more.
+    var non_zero_y: u32
+    var non_zero_uv: u32
+    var skip: bool
+    var segment: u8
+
+## A VP8 key frame being decoded (VP8Decoder).
+struct Vp8:
+    ## Partition 0: the headers and the intra modes.
+    var br: BoolReader
+    var partition_length: usize
+    var width: usize
+    var height: usize
+    var filter_hdr: FilterHeader
+    var segment_hdr: SegmentHeader
+    ## The picture in macroblocks.
+    var mb_w: usize
+    var mb_h: usize
+    ## The macroblocks to filter (top left) and to decode (bottom right, excluded).
+    var tl_mb_x: usize
+    var tl_mb_y: usize
+    var br_mb_x: usize
+    var br_mb_y: usize
+    ## The token partitions, one per macroblock row in turn.
+    var num_parts_minus_one: usize
+    var parts: BoolReader[8]
+    var dqm: QuantMatrix[4]
+    ## The segment tree's probabilities, and the coefficients' (VP8Proba).
+    var segment_probas: u8[3]
+    var bands: u8[1056]
+    var use_skip_proba: bool
+    var skip_p: u32
+    ## 0 off, 1 simple, 2 complex.
+    var filter_type: u32
+    ## The strengths of each segment, for 16x16 and 4x4 macroblocks.
+    var fstrengths: FilterInfo[8]
+
+# mark: Headers ===============================================================================
+
+## ResetSegmentHeader.
+func reset_segment_header(hdr: SegmentHeader*):
+    *hdr = SegmentHeader()
+    hdr.absolute_delta = true
+
+## ParseSegmentHeader (paragraph 9.3): false when partition 0 ended.
+func parse_segment_header(br: BoolReader*, hdr: SegmentHeader*, segment_probas: u8[]) -> bool:
+    hdr.use_segment = br.get_flag()
+    if hdr.use_segment:
+        hdr.update_map = br.get_flag()
+        if br.get_flag():
+            hdr.absolute_delta = br.get_flag()
+            for s in 0..<num_mb_segments:
+                hdr.quantizer[s] = br.get_signed_value(7) if br.get_flag() else 0
+            for s in 0..<num_mb_segments:
+                hdr.filter_strength[s] = br.get_signed_value(6) if br.get_flag() else 0
+        if hdr.update_map:
+            for s in 0..<(usize)3:
+                segment_probas[s] = (u8)br.get_value(8) if br.get_flag() else 255
+    else:
+        hdr.update_map = false
+    return not br.eof
+
+## ParseFilterHeader (paragraph 9.4): false when partition 0 ended.
+func parse_filter_header(br: BoolReader*, dec: Vp8*) -> bool:
+    let hdr = &dec.filter_hdr
+    hdr.simple = br.get_flag()
+    hdr.level = (i32)br.get_value(6)
+    hdr.sharpness = (i32)br.get_value(3)
+    hdr.use_lf_delta = br.get_flag()
+    if hdr.use_lf_delta:
+        if br.get_flag():
+            for i in 0..<(usize)4:
+                if br.get_flag():
+                    hdr.ref_lf_delta[i] = br.get_signed_value(6)
+            for i in 0..<(usize)4:
+                if br.get_flag():
+                    hdr.mode_lf_delta[i] = br.get_signed_value(6)
+    dec.filter_type = 0 if hdr.level == 0 else 1 if hdr.simple else 2
+    return not br.eof
+
+## ParsePartitions (paragraph 9.5): the token partitions after partition 0 in `data`.
+## Fails when even their sizes are missing, or the last one is empty.
+func parse_partitions(dec: Vp8*, data: const u8[]) -> !:
+    dec.num_parts_minus_one = ((usize)1 << (usize)dec.br.get_value(2)) - 1
+    let last_part = dec.num_parts_minus_one
+    if data.length < 3 * last_part:
+        error(corrupt, "VP8 partition sizes are missing")
+    var part_start = last_part * 3
+    var size_left = data.length - last_part * 3
+    for p in 0..<last_part:
+        var psize = (usize)data[p * 3] | ((usize)data[p * 3 + 1] << 8) | ((usize)data[p * 3 + 2] << 16)
+        if psize > size_left:
+            psize = size_left
+        dec.parts[p] = BoolReader.start(data[part_start..<part_start + psize])
+        part_start += psize
+        size_left -= psize
+    dec.parts[last_part] = BoolReader.start(data[part_start..<part_start + size_left])
+    if part_start >= data.length:
+        error(corrupt, "VP8 data ends before its last partition")
+
+## Clip `v` to 0..`top`.
+func clip_to(v: i32, top: i32) -> usize:
+    return 0 if v < 0 else (usize)top if v > top else (usize)v
+
+## VP8ParseQuant (paragraph 9.6): the dequantization factors of each segment.
+func parse_quant(dec: Vp8*):
+    let br = &dec.br
+    let base_q0 = (i32)br.get_value(7)
+    let dqy1_dc = br.get_signed_value(4) if br.get_flag() else 0
+    let dqy2_dc = br.get_signed_value(4) if br.get_flag() else 0
+    let dqy2_ac = br.get_signed_value(4) if br.get_flag() else 0
+    let dquv_dc = br.get_signed_value(4) if br.get_flag() else 0
+    let dquv_ac = br.get_signed_value(4) if br.get_flag() else 0
+    let hdr = &dec.segment_hdr
+    for i in 0..<num_mb_segments:
+        var q: i32 = 0
+        if hdr.use_segment:
+            q = hdr.quantizer[i]
+            if not hdr.absolute_delta:
+                q += base_q0
+        elif i > 0:
+            dec.dqm[i] = dec.dqm[0]
+            continue
+        else:
+            q = base_q0
+        let m = &dec.dqm[i]
+        m.y1[0] = dc_table[clip_to(q + dqy1_dc, 127)]
+        m.y1[1] = ac_table[clip_to(q, 127)]
+        m.y2[0] = dc_table[clip_to(q + dqy2_dc, 127)] * 2
+        # For all x in [0..284], x*155/100 is bitwise equal to (x*101581) >> 16.
+        m.y2[1] = (ac_table[clip_to(q + dqy2_ac, 127)] * 101581) >> 16
+        if m.y2[1] < 8:
+            m.y2[1] = 8
+        m.uv[0] = dc_table[clip_to(q + dquv_dc, 117)]
+        m.uv[1] = ac_table[clip_to(q + dquv_ac, 127)]
+        m.uv_quant = q + dquv_ac
+
+## VP8ParseProba (paragraph 13): the coefficient probabilities, each the default or an
+## update, and the skip probability.
+func parse_proba(br: BoolReader*, dec: Vp8*):
+    for i in 0..<dec.bands.length:
+        dec.bands[i] = (u8)br.get_value(8) if br.get_bit((u32)coeffs_update_proba[i]) != 0 else coeffs_proba0[i]
+    dec.use_skip_proba = br.get_flag()
+    if dec.use_skip_proba:
+        dec.skip_p = br.get_value(8)
+
+## VP8GetHeaders: the frame tag, the key frame header and partition 0's headers of the VP8
+## bitstream `data`.
+func get_headers(dec: Vp8*, data: const u8[]) -> !:
+    if data.length < 4:
+        error(corrupt, "VP8 header is truncated")
+    # Paragraph 9.1.
+    let bits = (u32)data[0] | ((u32)data[1] << 8) | ((u32)data[2] << 16)
+    let key_frame = (bits & 1) == 0
+    let profile = (bits >> 1) & 7
+    let show = ((bits >> 4) & 1) != 0
+    dec.partition_length = (usize)(bits >> 5)
+    if profile > 3:
+        error(corrupt, "VP8 key frame parameters are incorrect")
+    if not show:
+        error(unsupported, "VP8 frame is not displayable")
+    var buf = data[3..]
+    if key_frame:
+        # Paragraph 9.2.
+        if buf.length < 7:
+            error(corrupt, "VP8 picture header is truncated")
+        if not vp8_check_signature(buf):
+            error(corrupt, "VP8 code word is wrong")
+        dec.width = (((usize)buf[4] << 8) | (usize)buf[3]) & 0x3fff
+        dec.height = (((usize)buf[6] << 8) | (usize)buf[5]) & 0x3fff
+        buf = buf[7..]
+        dec.mb_w = (dec.width + 15) >> 4
+        dec.mb_h = (dec.height + 15) >> 4
+        dec.segment_probas = [255, 255, 255]
+        reset_segment_header(&dec.segment_hdr)
+    # Partition 0 must be there in full.
+    if dec.partition_length > buf.length:
+        error(corrupt, "VP8 partition length is wrong")
+    dec.br = BoolReader.start(buf[..<dec.partition_length])
+    buf = buf[dec.partition_length..]
+    let br = &dec.br
+    if key_frame:
+        # The color space and clamping type are read and not used.
+        _ = br.get_flag()
+        _ = br.get_flag()
+    if not parse_segment_header(br, &dec.segment_hdr, dec.segment_probas):
+        error(corrupt, "VP8 segment header cannot be parsed")
+    if not parse_filter_header(br, dec):
+        error(corrupt, "VP8 filter header cannot be parsed")
+    try parse_partitions(dec, buf)
+    parse_quant(dec)
+    if not key_frame:
+        error(unsupported, "VP8 frame is not a key frame")
+    # The value of 'update_proba' is ignored.
+    _ = br.get_flag()
+    parse_proba(br, dec)

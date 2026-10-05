@@ -1,0 +1,36 @@
+#==============================================================================================
+#
+#   webp/decode - A picture into an RGBA area
+#
+#   DESCRIPTION:
+#       Port of dec/webp_dec.c's DecodeInto with a caller's RGBA buffer
+#       (WebPDecodeRGBAInto, and WebPDecode as WebPAnimDecoder calls it for a frame): the
+#       headers parsed with all the data present (WebPParseHeaders, which refuses an
+#       animation), the output buffer checked (CheckDecBuffer), then the VP8 or VP8L
+#       bitstream decoded into it, a VP8 picture with its ALPH chunk.
+#
+#==============================================================================================
+
+## Decode the picture in `data` (a WebP file, or an animation frame's ALPH and VP8 or VP8L
+## chunks) into `area`.
+func decode_picture(data: const u8[], area: Area) -> !:
+    # WebPParseHeaders.
+    var headers: Headers = ---
+    var status = parse_headers(data, true, true, &headers)
+    if (status == Status.ok or status == Status.not_enough_data) and headers.animated:
+        status = Status.unsupported_feature
+    if status != Status.ok:
+        try fail_with(status, "WebP header")
+    let bitstream = data[headers.offset..]
+    if headers.lossless:
+        try decode_vp8l(bitstream, area)
+        return
+    let alpha = Alpha.of(headers.alpha_found, data[headers.alpha_offset..<headers.alpha_offset + headers.alpha_size], headers.width, headers.height)
+    try decode_vp8(bitstream, area, alpha)
+
+## CheckDecBuffer for RGBA: `area` holds `width` by `height` pixels.
+func check_area(area: Area, width: usize, height: usize) -> !:
+    if width == 0 or height == 0:
+        error(invalid, "WebP picture has no pixels")
+    if area.stride < width * 4 or area.size < area.stride * (height - 1) + width * 4:
+        error(invalid, "WebP output buffer is smaller than the picture")

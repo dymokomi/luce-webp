@@ -1,0 +1,154 @@
+#==============================================================================================
+#
+#   webp - WebP decoding: still pictures and animations, as libwebp 1.6.0 decodes them
+#
+#   DESCRIPTION:
+#       A faithful port of libwebp 1.6.0's decoder (src/dec, src/dsp, src/utils, the
+#       demuxer and WebPAnimDecoder of src/demux, and the reading half of src/mux), the
+#       version Ladybird links. It reads the RIFF container (simple VP8 and VP8L files,
+#       extended VP8X files with ALPH, ICCP, EXIF and XMP chunks, and ANIM/ANMF
+#       animations); VP8 lossy pictures (the boolean decoder, intra prediction, the
+#       inverse transforms, the simple and complex loop filters, segments and quantizers)
+#       turned into RGBA with libwebp's fancy upsampler; VP8L lossless pictures (Huffman
+#       groups, the color cache, the four transforms); ALPH alpha planes (raw or
+#       lossless, with their filters); and animations composited as WebPAnimDecoder
+#       composites them (disposal, blending, key frames). Output is libwebp's to the bit,
+#       with the options Ladybird uses: fancy upsampling on, no dithering.
+#
+#       `info` reads the features (WebPGetFeatures, and the demuxer's frame list for an
+#       animation); `decode_rgba8` decodes a still picture into straight RGBA
+#       (WebPDecodeRGBAInto); an `Animation` gives every frame of an animation as a whole
+#       canvas (WebPAnimDecoder); `icc_profile` gives the ICCP chunk's bytes as WebPMux
+#       reads them. Color management is the caller's (luce-color makes a color space of
+#       the profile).
+#
+#       Fragments, in ORDER:
+#
+#       module.lucb         the public API: errors, Info, Options, info, decode_rgba8
+#       container.lucb      the RIFF container: headers and features (webp_dec.c)
+#       decode.lucb         a picture into an RGBA area: VP8 or VP8L, its checks
+#       vp8_bits.lucb       VP8's boolean decoder (utils/bit_reader)
+#       vp8_tables.lucb     VP8's default and update probabilities, and its constants
+#       vp8_headers.lucb    the frame, segment, filter, quantizer and probability headers
+#       vp8_parse.lucb      intra modes and residual coefficients (tree_dec.c, vp8_dec.c)
+#       vp8_predict.lucb    intra prediction (dsp/dec.c)
+#       vp8_transform.lucb  the inverse DCT and WHT (dsp/dec.c)
+#       vp8_filter.lucb     the loop filters and their strengths (dsp/dec.c, frame_dec.c)
+#       vp8_frame.lucb      the decoder: memory, rows, reconstruction (frame_dec.c)
+#       vp8_output.lucb     rows to RGBA: fancy upsampling and alpha (io_dec.c, dsp/yuv)
+#       alpha.lucb          the ALPH chunk (alpha_dec.c, dsp/filters.c)
+#       vp8l_bits.lucb      VP8L's bit reader (utils/bit_reader)
+#       vp8l_huffman.lucb   Huffman tables and groups (utils/huffman_utils.c, vp8l_dec.c)
+#       vp8l_decode.lucb    the lossless image streams (vp8l_dec.c)
+#       vp8l_transform.lucb the inverse transforms and color conversion (dsp/lossless.c)
+#       vp8l_output.lucb    lossless rows out: RGBA and alpha planes (vp8l_dec.c)
+#       demux.lucb          the demuxer: the frames of a file (demux/demux.c)
+#       animation.lucb      Animation: frames composited (demux/anim_decode.c)
+#       mux.lucb            the ICC profile, read as WebPMux reads a file (mux/muxread.c)
+#
+#       The output is libwebp's portable C code's (its SIMD paths agree on every valid file;
+#       on a few damaged ones NEON's saturating transforms differ from the C code, which is
+#       the reference). The hot paths (the bit readers, the color conversion) use wrapping
+#       arithmetic where libwebp's values are bounded, so as not to pay for checks that
+#       cannot fail.
+#
+#       libwebp is Copyright (c) 2010, Google Inc., BSD-3-Clause (LICENSE-libwebp); the
+#       port keeps its structure, names and comments.
+#
+#==============================================================================================
+
+import memory
+
+# mark: Errors ================================================================================
+
+## The bytes are not a WebP, or its bitstream is damaged or ends early
+## (VP8_STATUS_BITSTREAM_ERROR, VP8_STATUS_NOT_ENOUGH_DATA).
+pub let corrupt: ErrorCode = ErrorCode.package(1)
+
+## A limit in `Options` was reached: the canvas has more pixels than `max_pixels`.
+pub let limit: ErrorCode = ErrorCode.package(2)
+
+## The caller's request cannot be met: an output buffer too small, a frame index past
+## the last frame (VP8_STATUS_INVALID_PARAM).
+pub let invalid: ErrorCode = ErrorCode.package(3)
+
+## The file uses what WebP decoders refuse: an animation where a still picture is asked
+## for, a VP8 frame that is not a shown key frame (VP8_STATUS_UNSUPPORTED_FEATURE).
+pub let unsupported: ErrorCode = ErrorCode.package(4)
+
+# mark: Information ===========================================================================
+
+## How a WebP's picture is compressed (WebPBitstreamFeatures.format).
+pub enum Format:
+    ## Not known: an animation, whose frames may mix both.
+    mixed
+    ## VP8.
+    lossy
+    ## VP8L.
+    lossless
+
+## A WebP's canvas, alpha and animation, as WebPGetFeatures and the demuxer read them.
+pub struct Info:
+    ## The canvas: the VP8X chunk's size, else the picture's.
+    pub var width: usize
+    pub var height: usize
+    ## Whether the picture may have transparent pixels: the VP8X alpha flag, an ALPH
+    ## chunk, or the VP8L header's alpha bit (WebPBitstreamFeatures.has_alpha).
+    pub var alpha: bool
+    ## Whether the VP8X chunk's animation flag is set.
+    pub var animated: bool
+    pub var format: Format = Format.mixed
+    ## The frames: 1 for a still picture, the ANMF chunks for an animation.
+    pub var frame_count: usize = 1
+    ## How many times an animation plays, the ANIM chunk's loop count: 0 forever. 0 for
+    ## a still picture.
+    pub var loop_count: u32
+    ## The ANIM chunk's background color as written (0xAARRGGBB, little-endian in the
+    ## file); libwebp, like browsers, clears the canvas to transparent instead.
+    pub var background: u32
+
+    ## How many times browsers play the animation in all: 0 forever, else the loop count
+    ## (a still picture plays once).
+    pub func plays() -> u32:
+        if not self.animated:
+            return 1
+        return self.loop_count
+
+## How a decode runs.
+pub struct Options:
+    ## The most pixels a canvas may have. An `Animation` holds two canvases.
+    pub var max_pixels: usize = 268435456
+
+# mark: Decoding ==============================================================================
+
+## The canvas, alpha, format and, for an animation, the frame and loop counts of the WebP
+## in `data`: WebPGetFeatures, then WebPAnimDecoderNew's demuxer for an animation.
+pub func info(data: const u8[]) -> Info!:
+    var found = try features(data)
+    if found.animated:
+        var demuxer = try Demuxer.open(data)
+        defer demuxer.release()
+        found.frame_count = demuxer.count
+        found.loop_count = demuxer.loop_count
+        found.background = demuxer.background
+    return found
+
+## Decode the WebP in `data` into `out`, `width * height * 4` bytes of straight RGBA: a
+## still picture as WebPDecodeRGBAInto decodes it, the first frame of an animation as
+## WebPAnimDecoder composites it.
+pub func decode_rgba8(data: const u8[], out: u8[], options: Options = Options()) -> !:
+    let found = try features(data)
+    try check_canvas(found.width, found.height, options)
+    if out.length < found.width * found.height * 4:
+        error(invalid, "WebP output buffer is smaller than the picture")
+    if found.animated:
+        var animation = try Animation.open(data, options)
+        defer animation.release()
+        try animation.render(0, out)
+        return
+    try decode_picture(data, Area(pixels = out.data, stride = found.width * 4, size = found.width * found.height * 4))
+
+## Fail when a `width` by `height` canvas is over the limit.
+func check_canvas(width: usize, height: usize, options: Options) -> !:
+    if width != 0 and height > options.max_pixels // width:
+        error(limit, "WebP canvas has more pixels than allowed")

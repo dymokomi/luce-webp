@@ -1,0 +1,65 @@
+#==============================================================================================
+#
+#   tests/webp/files - The fixtures, read for the tests
+#
+#   DESCRIPTION:
+#       The tests run from the package's root (tests/run.py) and read tests/fixtures
+#       through the C library's stdio, and look at pixels of the RGBA they decode.
+#
+#==============================================================================================
+
+import c as libc
+import strings
+
+extern func fopen(path: libc.str, mode: libc.str) -> void*?
+extern func fclose(file: void*) -> i32
+extern func fread(data: void*, size: usize, count: usize, file: void*) -> usize
+
+## The bytes of tests/fixtures/`name`, on the heap.
+func fixture(name: str) -> u8[]!:
+    var path_buffer: u8[256]
+    let path = try strings.format(path_buffer, f"tests/fixtures/{name}")
+    let file = fopen((libc.str)path, "rb") else error(invalid, "cannot open the fixture")
+    defer _ = fclose(file)
+    var size: usize = 0
+    var data = try new u8[65536] --- in memory.heap
+    errdefer free(data) in memory.heap
+    while true:
+        if size == data.length:
+            let larger = try new u8[data.length * 2] --- in memory.heap
+            memory.copy(larger, data, size)
+            free(data) in memory.heap
+            data = larger
+        let count = fread(&data[size], 1, data.length - size, file)
+        if count == 0:
+            break
+        size += count
+    let exact = try new u8[size] --- in memory.heap
+    memory.copy(exact, data, size)
+    free(data) in memory.heap
+    return exact
+
+## A decoded still fixture: its features and straight RGBA.
+struct Decoded:
+    var found: Info
+    var pixels: u8[]
+
+    func release():
+        free(self.pixels) in memory.heap
+
+    ## The pixel at (`x`, `y`) as 0xRRGGBBAA, as Ladybird reads it: a picture without
+    ## alpha is drawn opaque (its bitmap is BGRx8888).
+    func pixel(x: usize, y: usize) -> u32:
+        let at = (y * self.found.width + x) * 4
+        let alpha = (u32)self.pixels[at + 3] if self.found.alpha else 255
+        return ((u32)self.pixels[at] << 24) | ((u32)self.pixels[at + 1] << 16) | ((u32)self.pixels[at + 2] << 8) | alpha
+
+## Decode the still fixture `name`.
+func decode_fixture(name: str) -> Decoded!:
+    let data = try fixture(name)
+    defer free(data) in memory.heap
+    let found = try features(data)
+    let pixels = try new u8[found.width * found.height * 4] --- in memory.heap
+    errdefer free(pixels) in memory.heap
+    try decode_rgba8(data, pixels)
+    return Decoded(found = found, pixels = pixels)

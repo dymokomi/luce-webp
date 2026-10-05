@@ -1,0 +1,330 @@
+#==============================================================================================
+#
+#   webp/vp8l_transform - The inverse transforms and color conversion
+#
+#   DESCRIPTION:
+#       Port of dsp/lossless.c and dsp/lossless_common.h: the four VP8L transforms undone
+#       (the predictor transform with its 14 predictors per tile, the cross-color
+#       transform, the subtract-green transform, and color indexing with pixel bundling),
+#       and ARGB to RGBA. Pixels are ARGB words: alpha in the top byte, blue in the low.
+#       The predictor reads the row above from the output (`out - width`); the caller
+#       keeps the last row of a batch there for the next batch.
+#
+#==============================================================================================
+
+## The transforms (VP8LImageTransformType).
+let predictor_transform: u32 = 0
+let cross_color_transform: u32 = 1
+let subtract_green_transform: u32 = 2
+let color_indexing_transform: u32 = 3
+let argb_black: u32 = 0xff000000
+
+## A transform read from the stream (VP8LTransform).
+struct Transform:
+    var kind: u32
+    ## The tile size's bits, or the bundling's for color indexing.
+    var bits: u32
+    ## The size of the image the transform applies to.
+    var xsize: usize
+    var ysize: usize
+    ## Its sub-image (predictor modes, color multipliers) or palette.
+    var data: u32[]
+
+## VP8LSubSampleSize: `size` divided by 2^`bits`, rounded up.
+inline func sub_sample_size(size: usize, bits: u32) -> usize:
+    return (size + ((usize)1 << bits) - 1) >> bits
+
+# mark: Pixels ================================================================================
+
+## VP8LAddPixels: the channels added, each modulo 256.
+inline func add_pixels(a: u32, b: u32) -> u32:
+    let alpha_and_green = (a & 0xff00ff00) +% (b & 0xff00ff00)
+    let red_and_blue = (a & 0x00ff00ff) +% (b & 0x00ff00ff)
+    return (alpha_and_green & 0xff00ff00) | (red_and_blue & 0x00ff00ff)
+
+## Average2: each channel's average, rounded down.
+inline func average2(a0: u32, a1: u32) -> u32:
+    return (((a0 ^ a1) & 0xfefefefe) >> 1) + (a0 & a1)
+
+## Clip255: a channel computed in 32 bits back to 0..255 (negative is 0).
+inline func clip255(a: u32) -> u32:
+    if a < 256:
+        return a
+    return ~a >> 24
+
+## AddSubtractComponentFull.
+inline func add_subtract_full(a: u32, b: u32, c: u32) -> u32:
+    return clip255(a +% b -% c)
+
+## ClampedAddSubtractFull: left + top - top left, per channel, clamped.
+inline func clamped_add_subtract_full(c0: u32, c1: u32, c2: u32) -> u32:
+    let a = add_subtract_full(c0 >> 24, c1 >> 24, c2 >> 24)
+    let r = add_subtract_full((c0 >> 16) & 0xff, (c1 >> 16) & 0xff, (c2 >> 16) & 0xff)
+    let g = add_subtract_full((c0 >> 8) & 0xff, (c1 >> 8) & 0xff, (c2 >> 8) & 0xff)
+    let b = add_subtract_full(c0 & 0xff, c1 & 0xff, c2 & 0xff)
+    return (a << 24) | (r << 16) | (g << 8) | b
+
+## AddSubtractComponentHalf: a + (a - b) / 2, the division truncating toward zero.
+inline func add_subtract_half(a: i32, b: i32) -> u32:
+    return clip255((u32)(a + (a - b) // 2))
+
+## ClampedAddSubtractHalf.
+inline func clamped_add_subtract_half(c0: u32, c1: u32, c2: u32) -> u32:
+    let ave = average2(c0, c1)
+    let a = add_subtract_half((i32)(ave >> 24), (i32)(c2 >> 24))
+    let r = add_subtract_half((i32)((ave >> 16) & 0xff), (i32)((c2 >> 16) & 0xff))
+    let g = add_subtract_half((i32)((ave >> 8) & 0xff), (i32)((c2 >> 8) & 0xff))
+    let b = add_subtract_half((i32)(ave & 0xff), (i32)(c2 & 0xff))
+    return (a << 24) | (r << 16) | (g << 8) | b
+
+## Sub3: |b - c| - |a - c|.
+inline func sub3(a: i32, b: i32, c: i32) -> i32:
+    let pb = b - c
+    let pa = a - c
+    return (pb if pb >= 0 else -pb) - (pa if pa >= 0 else -pa)
+
+## Select: `a` or `b`, whichever is closer to a + b - c in the sum of the channels.
+inline func select(a: u32, b: u32, c: u32) -> u32:
+    let by_alpha = sub3((i32)(a >> 24), (i32)(b >> 24), (i32)(c >> 24))
+    let by_red = sub3((i32)((a >> 16) & 0xff), (i32)((b >> 16) & 0xff), (i32)((c >> 16) & 0xff))
+    let by_green = sub3((i32)((a >> 8) & 0xff), (i32)((b >> 8) & 0xff), (i32)((c >> 8) & 0xff))
+    let by_blue = sub3((i32)(a & 0xff), (i32)(b & 0xff), (i32)(c & 0xff))
+    let pa_minus_pb = by_alpha + by_red + by_green + by_blue
+    return a if pa_minus_pb <= 0 else b
+
+# mark: The predictor transform ===============================================================
+
+## PredictorAdd N: `num_pixels` residuals at `input` plus their predictions into `out`, the
+## row above at `upper`; the pixel left of `out` is `out[-1]` (VP8LPredictor N). Modes 14
+## and 15 are mode 0 (VP8LPredictorsAdd's sentinels).
+func predictor_add(mode: u32, input: const u32*, upper: const u32*, num_pixels: usize, out: u32*):
+    match mode:
+        1:
+            var left = (out - 1)[0]
+            for x in 0..<num_pixels:
+                left = add_pixels(input[x], left)
+                out[x] = left
+        2:
+            for x in 0..<num_pixels:
+                out[x] = add_pixels(input[x], upper[x])
+        3:
+            for x in 0..<num_pixels:
+                out[x] = add_pixels(input[x], upper[x + 1])
+        4:
+            for x in 0..<num_pixels:
+                out[x] = add_pixels(input[x], (upper + x - 1)[0])
+        5:
+            for x in 0..<num_pixels:
+                out[x] = add_pixels(input[x], average2(average2((out + x - 1)[0], upper[x + 1]), upper[x]))
+        6:
+            for x in 0..<num_pixels:
+                out[x] = add_pixels(input[x], average2((out + x - 1)[0], (upper + x - 1)[0]))
+        7:
+            for x in 0..<num_pixels:
+                out[x] = add_pixels(input[x], average2((out + x - 1)[0], upper[x]))
+        8:
+            for x in 0..<num_pixels:
+                out[x] = add_pixels(input[x], average2((upper + x - 1)[0], upper[x]))
+        9:
+            for x in 0..<num_pixels:
+                out[x] = add_pixels(input[x], average2(upper[x], upper[x + 1]))
+        10:
+            for x in 0..<num_pixels:
+                out[x] = add_pixels(input[x], average2(average2((out + x - 1)[0], (upper + x - 1)[0]), average2(upper[x], upper[x + 1])))
+        11:
+            for x in 0..<num_pixels:
+                out[x] = add_pixels(input[x], select(upper[x], (out + x - 1)[0], (upper + x - 1)[0]))
+        12:
+            for x in 0..<num_pixels:
+                out[x] = add_pixels(input[x], clamped_add_subtract_full((out + x - 1)[0], upper[x], (upper + x - 1)[0]))
+        13:
+            for x in 0..<num_pixels:
+                out[x] = add_pixels(input[x], clamped_add_subtract_half((out + x - 1)[0], upper[x], (upper + x - 1)[0]))
+        _:
+            for x in 0..<num_pixels:
+                out[x] = add_pixels(input[x], argb_black)
+
+## PredictorInverseTransform: rows `y_start` to `y_end` of `input` into `out`.
+func predictor_inverse_transform(transform: const Transform*, y_start: usize, y_end: usize, input: const u32*, out: u32*):
+    let width = transform.xsize
+    var src = input
+    var dst = out
+    var y = y_start
+    if y == 0:
+        # The first row follows the L mode (1), its first pixel black (0).
+        predictor_add(0, src, dst, 1, dst)
+        predictor_add(1, src + 1, dst + 1, width - 1, dst + 1)
+        src = src + width
+        dst = dst + width
+        y += 1
+    let tile_width = (usize)1 << transform.bits
+    let mask = tile_width - 1
+    let tiles_per_row = sub_sample_size(width, transform.bits)
+    var pred_mode_base = transform.data.data + (y >> transform.bits) * tiles_per_row
+    while y < y_end:
+        var pred_mode_src = pred_mode_base
+        # The first pixel follows the T mode (2).
+        predictor_add(2, src, dst - width, 1, dst)
+        var x: usize = 1
+        while x < width:
+            let mode = (pred_mode_src[0] >> 8) & 0xf
+            pred_mode_src = pred_mode_src + 1
+            var x_end = (x & ~mask) + tile_width
+            if x_end > width:
+                x_end = width
+            predictor_add(mode, src + x, dst + x - width, x_end - x, dst + x)
+            x = x_end
+        src = src + width
+        dst = dst + width
+        y += 1
+        if (y & mask) == 0:
+            # The same mask: tiles are square.
+            pred_mode_base = pred_mode_base + tiles_per_row
+
+# mark: The other transforms ==================================================================
+
+## VP8LAddGreenToBlueAndRed: the subtract-green transform undone.
+func add_green_to_blue_and_red(src: const u32*, num_pixels: usize, dst: u32*):
+    for i in 0..<num_pixels:
+        let argb = src[i]
+        let green = (argb >> 8) & 0xff
+        var red_blue = argb & 0x00ff00ff
+        red_blue = red_blue +% ((green << 16) | green)
+        red_blue &= 0x00ff00ff
+        dst[i] = (argb & 0xff00ff00) | red_blue
+
+## ColorTransformDelta: (color_pred * color) >> 5, both signed bytes.
+inline func color_transform_delta(color_pred: u32, color: u32) -> i32:
+    return ((i32)(i8)(u8)color_pred * (i32)(i8)(u8)color) >> 5
+
+## ColorSpaceInverseTransform: the cross-color transform undone, a tile's multipliers at a
+## time.
+func color_space_inverse_transform(transform: const Transform*, y_start: usize, y_end: usize, input: const u32*, out: u32*):
+    let width = transform.xsize
+    let tile_width = (usize)1 << transform.bits
+    let tiles_per_row = sub_sample_size(width, transform.bits)
+    var src = input
+    var dst = out
+    var y = y_start
+    var pred_row = transform.data.data + (y >> transform.bits) * tiles_per_row
+    while y < y_end:
+        var x: usize = 0
+        var pred = pred_row
+        while x < width:
+            let code = pred[0]
+            pred = pred + 1
+            let green_to_red = code & 0xff
+            let green_to_blue = (code >> 8) & 0xff
+            let red_to_blue = (code >> 16) & 0xff
+            let end = x + tile_width if x + tile_width < width else width
+            for i in x..<end:
+                # VP8LTransformColorInverse.
+                let argb = src[i]
+                let green = argb >> 8
+                var new_red = (i32)((argb >> 16) & 0xff)
+                var new_blue = (i32)(argb & 0xff)
+                new_red += color_transform_delta(green_to_red, green)
+                new_red &= 0xff
+                new_blue += color_transform_delta(green_to_blue, green)
+                new_blue += color_transform_delta(red_to_blue, (u32)new_red)
+                new_blue &= 0xff
+                dst[i] = (argb & 0xff00ff00) | ((u32)new_red << 16) | (u32)new_blue
+            x = end
+        src = src + width
+        dst = dst + width
+        y += 1
+        if (y & (tile_width - 1)) == 0:
+            pred_row = pred_row + tiles_per_row
+
+## ColorIndexInverseTransform (ARGB): each index through the palette, several indices to
+## a pixel when bundled.
+func color_index_inverse_transform(transform: const Transform*, y_start: usize, y_end: usize, input: const u32*, out: u32*):
+    let bits_per_pixel = (u32)8 >> transform.bits
+    let width = transform.xsize
+    let color_map = transform.data.data
+    var src = input
+    var dst = out
+    if bits_per_pixel < 8:
+        let pixels_per_byte = (usize)1 << transform.bits
+        let count_mask = pixels_per_byte - 1
+        let bit_mask = ((u32)1 << bits_per_pixel) - 1
+        for y in y_start..<y_end:
+            var packed_pixels: u32 = 0
+            for x in 0..<width:
+                if (x & count_mask) == 0:
+                    packed_pixels = (src[0] >> 8) & 0xff
+                    src = src + 1
+                dst[0] = color_map[(usize)(packed_pixels & bit_mask)]
+                dst = dst + 1
+                packed_pixels >>= bits_per_pixel
+        return
+    for y in y_start..<y_end:
+        for x in 0..<width:
+            dst[x] = color_map[(usize)((src[x] >> 8) & 0xff)]
+        src = src + width
+        dst = dst + width
+
+## VP8LColorIndexInverseTransformAlpha: the same over alpha bytes, the palette's green as
+## the value.
+func color_index_inverse_transform_alpha(transform: const Transform*, y_start: usize, y_end: usize, input: const u8*, out: u8*):
+    let bits_per_pixel = (u32)8 >> transform.bits
+    let width = transform.xsize
+    let color_map = transform.data.data
+    var src = input
+    var dst = out
+    if bits_per_pixel < 8:
+        let pixels_per_byte = (usize)1 << transform.bits
+        let count_mask = pixels_per_byte - 1
+        let bit_mask = ((u32)1 << bits_per_pixel) - 1
+        for y in y_start..<y_end:
+            var packed_pixels: u32 = 0
+            for x in 0..<width:
+                if (x & count_mask) == 0:
+                    packed_pixels = (u32)src[0]
+                    src = src + 1
+                dst[0] = (u8)((color_map[(usize)(packed_pixels & bit_mask)] >> 8) & 0xff)
+                dst = dst + 1
+                packed_pixels >>= bits_per_pixel
+        return
+    for y in y_start..<y_end:
+        for x in 0..<width:
+            dst[x] = (u8)((color_map[(usize)src[x]] >> 8) & 0xff)
+        src = src + width
+        dst = dst + width
+
+## VP8LInverseTransform: rows `row_start` to `row_end` through `transform`, from `input` into
+## `out` (which may be `input`).
+func inverse_transform(transform: const Transform*, row_start: usize, row_end: usize, input: const u32*, out: u32*):
+    let width = transform.xsize
+    match transform.kind:
+        0:
+            predictor_inverse_transform(transform, row_start, row_end, input, out)
+            if row_end != transform.ysize:
+                # The last row predicted is the next batch's row above.
+                let rows = row_end - row_start
+                memory.copy(u32[](out - width, width), u32[](out + (rows - 1) * width, width), width)
+        1:
+            color_space_inverse_transform(transform, row_start, row_end, input, out)
+        2:
+            add_green_to_blue_and_red(input, (row_end - row_start) * width, out)
+        _:
+            if (const u32*)out == input and transform.bits > 0:
+                # The packed pixels moved to the end of the unpacked region, so that they
+                # unpack forward. Color indexing alone works on the packed width.
+                let out_stride = (row_end - row_start) * width
+                let in_stride = (row_end - row_start) * sub_sample_size(transform.xsize, transform.bits)
+                let src = out + out_stride - in_stride
+                memory.move(u32[](src, in_stride), u32[](out, in_stride), in_stride)
+                color_index_inverse_transform(transform, row_start, row_end, src, out)
+            else:
+                color_index_inverse_transform(transform, row_start, row_end, input, out)
+
+## VP8LConvertBGRAToRGBA: ARGB words to RGBA bytes.
+func convert_to_rgba(src: const u32*, num_pixels: usize, dst: u8*):
+    for i in 0..<num_pixels:
+        let argb = src[i]
+        let at = dst + i * 4
+        at[0] = (u8)(argb >> 16)
+        at[1] = (u8)(argb >> 8)
+        at[2] = (u8)argb
+        at[3] = (u8)(argb >> 24)

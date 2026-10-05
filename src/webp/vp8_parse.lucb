@@ -1,0 +1,249 @@
+#==============================================================================================
+#
+#   webp/vp8_parse - Intra modes and residual coefficients
+#
+#   DESCRIPTION:
+#       Port of dec/tree_dec.c's intra mode parsing (ParseIntraMode, paragraph 11) and
+#       dec/vp8_dec.c's residual parsing (GetCoeffs, ParseResiduals, VP8DecodeMB,
+#       paragraph 13). Partition 0 gives each macroblock's segment, skip flag and
+#       prediction modes, a row at a time; the token partitions give its coefficients,
+#       dequantized as they are read, with the non-zero contexts of the blocks above and
+#       to the left. libwebp's coded tree for the 4x4 modes (USE_GENERIC_TREE 0, its
+#       choice on arm64) reads the same bits as the table it uses on x86.
+#
+#==============================================================================================
+
+# mark: Intra modes ===========================================================================
+
+## ParseIntraMode: the segment, skip flag and modes of macroblock `mb_x` of the row.
+func parse_intra_mode(br: BoolReader*, dec: Vp8*, fb: FrameBuffers*, mb_x: usize):
+    let top = fb.intra_t.data + 4 * mb_x
+    let left = &fb.intra_l[0]
+    let block = &fb.mb_data[mb_x]
+    # The segment map is not kept: a WebP has one key frame.
+    if dec.segment_hdr.update_map:
+        if br.get_bit((u32)dec.segment_probas[0]) == 0:
+            block.segment = (u8)br.get_bit((u32)dec.segment_probas[1])
+        else:
+            block.segment = (u8)br.get_bit((u32)dec.segment_probas[2]) + 2
+    else:
+        block.segment = 0
+    if dec.use_skip_proba:
+        block.skip = br.get_bit(dec.skip_p) != 0
+    block.is_i4x4 = br.get_bit(145) == 0
+    if not block.is_i4x4:
+        # The 16x16 mode tree.
+        var ymode: u8 = 0
+        if br.get_bit(156) != 0:
+            ymode = tm_pred if br.get_bit(128) != 0 else h_pred
+        else:
+            ymode = v_pred if br.get_bit(163) != 0 else dc_pred
+        block.imodes[0] = ymode
+        fill_bytes(top, ymode, 4)
+        fill_bytes(left, ymode, 4)
+    else:
+        for y in 0..<(usize)4:
+            var ymode = left[y]
+            for x in 0..<(usize)4:
+                let prob = &bmodes_proba[((usize)top[x] * 10 + (usize)ymode) * 9]
+                ymode = read_bmode(br, prob)
+                top[x] = ymode
+            copy_bytes(&block.imodes[y * 4], top, 4)
+            left[y] = ymode
+    # The chroma mode tree.
+    if br.get_bit(142) == 0:
+        block.uvmode = dc_pred
+    elif br.get_bit(114) == 0:
+        block.uvmode = v_pred
+    else:
+        block.uvmode = tm_pred if br.get_bit(183) != 0 else h_pred
+
+## A 4x4 mode, by the coded tree, with the probabilities at `prob`.
+inline func read_bmode(br: BoolReader*, prob: const u8*) -> u8:
+    if br.get_bit((u32)prob[0]) == 0:
+        return b_dc_pred
+    if br.get_bit((u32)prob[1]) == 0:
+        return b_tm_pred
+    if br.get_bit((u32)prob[2]) == 0:
+        return b_ve_pred
+    if br.get_bit((u32)prob[3]) == 0:
+        if br.get_bit((u32)prob[4]) == 0:
+            return b_he_pred
+        return b_rd_pred if br.get_bit((u32)prob[5]) == 0 else b_vr_pred
+    if br.get_bit((u32)prob[6]) == 0:
+        return b_ld_pred
+    if br.get_bit((u32)prob[7]) == 0:
+        return b_vl_pred
+    return b_hd_pred if br.get_bit((u32)prob[8]) == 0 else b_hu_pred
+
+## VP8ParseIntraModeRow: the modes of a row of macroblocks; false when partition 0 ended.
+func parse_intra_mode_row(dec: Vp8*, fb: FrameBuffers*) -> bool:
+    for mb_x in 0..<dec.mb_w:
+        parse_intra_mode(&dec.br, dec, fb, mb_x)
+    return not dec.br.eof
+
+# mark: Coefficients ==========================================================================
+
+## GetLargeValue (paragraph 13.2): a coefficient's magnitude above 1.
+func get_large_value(br: BoolReader*, p: const u8*) -> i32:
+    if br.get_bit((u32)p[3]) == 0:
+        if br.get_bit((u32)p[4]) == 0:
+            return 2
+        return 3 + (i32)br.get_bit((u32)p[5])
+    if br.get_bit((u32)p[6]) == 0:
+        if br.get_bit((u32)p[7]) == 0:
+            return 5 + (i32)br.get_bit(159)
+        var v = 7 + 2 * (i32)br.get_bit(165)
+        v += (i32)br.get_bit(145)
+        return v
+    let bit1 = br.get_bit((u32)p[8])
+    let bit0 = br.get_bit((u32)p[9 + bit1])
+    let cat = 2 * bit1 + bit0
+    var v: i32 = 0
+    if cat == 0:
+        for prob in cat3:
+            v += v + (i32)br.get_bit((u32)prob)
+    elif cat == 1:
+        for prob in cat4:
+            v += v + (i32)br.get_bit((u32)prob)
+    elif cat == 2:
+        for prob in cat5:
+            v += v + (i32)br.get_bit((u32)prob)
+    else:
+        for prob in cat6:
+            v += v + (i32)br.get_bit((u32)prob)
+    return v + 3 + ((i32)8 << cat)
+
+## GetCoeffs: the coefficients of one 4x4 block from position `first`, with the block
+## type's probabilities at `probas`, dequantized by `dc` and `ac` into `out`. Returns the
+## position of the last non-zero coefficient plus one.
+func get_coeffs(br: BoolReader*, probas: const u8*, ctx: usize, dc: i32, ac: i32, first: usize, out: i16*) -> usize:
+    var n = first
+    var p = probas + (usize)band_offsets[n] + ctx * num_probas
+    while n < 16:
+        if br.get_bit((u32)p[0]) == 0:
+            # The previous coefficient was the last non-zero one.
+            return n
+        while br.get_bit((u32)p[1]) == 0:
+            # A run of zero coefficients.
+            n += 1
+            if n == 16:
+                return 16
+            p = probas + (usize)band_offsets[n]
+        # A non-zero coefficient.
+        let p_ctx = probas + (usize)band_offsets[n + 1]
+        var v: i32 = 1
+        if br.get_bit((u32)p[2]) == 0:
+            p = p_ctx + num_probas
+        else:
+            v = get_large_value(br, p)
+            p = p_ctx + 2 * num_probas
+        out[(usize)zigzag[n]] = (i16)(br.get_signed(v) * (ac if n > 0 else dc))
+        n += 1
+    return 16
+
+## NzCodeBits: a block's two bits of non-zero information appended to `nz_coeffs`.
+inline func nz_code_bits(nz_coeffs: u32, nz: usize, dc_nz: bool) -> u32:
+    let code: u32 = 3 if nz > 3 else 2 if nz > 1 else 1 if dc_nz else 0
+    return (nz_coeffs << 2) | code
+
+## ParseResiduals: the coefficients of macroblock `mb_x`; true when it has none.
+func parse_residuals(dec: Vp8*, fb: FrameBuffers*, mb_x: usize, token_br: BoolReader*) -> bool:
+    let block = &fb.mb_data[mb_x]
+    let q = &dec.dqm[(usize)block.segment]
+    let mb = &fb.mb_info[mb_x + 1]
+    let left_mb = &fb.mb_info[0]
+    let bands = &dec.bands[0]
+    let type_size = num_bands * num_ctx * num_probas
+    var dst = &block.coeffs[0]
+    memory.set(u8[]((u8*)dst, 384 * 2), 0)
+    var first: usize = 0
+    var ac_proba = bands + 3 * type_size
+    if not block.is_i4x4:
+        # The DCs, through the WHT.
+        var dc: i16[16]
+        let ctx = (usize)mb.nz_dc + (usize)left_mb.nz_dc
+        let nz = get_coeffs(token_br, bands + type_size, ctx, q.y2[0], q.y2[1], 0, &dc[0])
+        let any = (u8)1 if nz > 0 else 0
+        mb.nz_dc = any
+        left_mb.nz_dc = any
+        if nz > 1:
+            transform_wht(&dc[0], dst)
+        else:
+            # Only the DC: the simplified transform.
+            let dc0 = (i16)(((i32)dc[0] + 3) >> 3)
+            for i in 0..<(usize)16:
+                dst[i * 16] = dc0
+        first = 1
+        ac_proba = bands
+    var tnz = (u32)mb.nz & 0x0f
+    var lnz = (u32)left_mb.nz & 0x0f
+    var non_zero_y: u32 = 0
+    for y in 0..<(usize)4:
+        var l = lnz & 1
+        var nz_coeffs: u32 = 0
+        for x in 0..<(usize)4:
+            let ctx = (usize)(l + (tnz & 1))
+            let nz = get_coeffs(token_br, ac_proba, ctx, q.y1[0], q.y1[1], first, dst)
+            l = 1 if nz > first else 0
+            tnz = (tnz >> 1) | (l << 7)
+            nz_coeffs = nz_code_bits(nz_coeffs, nz, dst[0] != 0)
+            dst = dst + 16
+        tnz >>= 4
+        lnz = (lnz >> 1) | (l << 7)
+        non_zero_y = (non_zero_y << 8) | nz_coeffs
+    var out_t_nz = tnz
+    var out_l_nz = lnz >> 4
+    var non_zero_uv: u32 = 0
+    for ch in [(u32)0, 2]:
+        var nz_coeffs: u32 = 0
+        tnz = (u32)mb.nz >> (4 + ch)
+        lnz = (u32)left_mb.nz >> (4 + ch)
+        for y in 0..<(usize)2:
+            var l = lnz & 1
+            for x in 0..<(usize)2:
+                let ctx = (usize)(l + (tnz & 1))
+                let nz = get_coeffs(token_br, bands + 2 * type_size, ctx, q.uv[0], q.uv[1], 0, dst)
+                l = 1 if nz > 0 else 0
+                tnz = (tnz >> 1) | (l << 3)
+                nz_coeffs = nz_code_bits(nz_coeffs, nz, dst[0] != 0)
+                dst = dst + 16
+            tnz >>= 2
+            lnz = (lnz >> 1) | (l << 5)
+        # The per-4x4 details are not needed for U and V.
+        non_zero_uv |= nz_coeffs << (4 * ch)
+        out_t_nz |= (tnz << 4) << ch
+        out_l_nz |= (lnz & 0xf0) << ch
+    mb.nz = (u8)out_t_nz
+    left_mb.nz = (u8)out_l_nz
+    block.non_zero_y = non_zero_y
+    block.non_zero_uv = non_zero_uv
+    return (non_zero_y | non_zero_uv) == 0
+
+## VP8DecodeMB: macroblock `mb_x`'s coefficients and filter strength; false when its
+## token partition ended.
+func decode_macroblock(dec: Vp8*, fb: FrameBuffers*, mb_x: usize, token_br: BoolReader*) -> bool:
+    let block = &fb.mb_data[mb_x]
+    var skip = block.skip if dec.use_skip_proba else false
+    if not skip:
+        skip = parse_residuals(dec, fb, mb_x, token_br)
+    else:
+        let mb = &fb.mb_info[mb_x + 1]
+        let left = &fb.mb_info[0]
+        left.nz = 0
+        mb.nz = 0
+        if not block.is_i4x4:
+            left.nz_dc = 0
+            mb.nz_dc = 0
+        block.non_zero_y = 0
+        block.non_zero_uv = 0
+    if dec.filter_type > 0:
+        var strength = dec.fstrengths[(usize)block.segment * 2 + (1 if block.is_i4x4 else 0)]
+        strength.inner = strength.inner or not skip
+        fb.f_info[mb_x] = strength
+    return not token_br.eof
+
+## VP8InitScanline: the left contexts reset for a new row.
+func init_scanline(fb: FrameBuffers*):
+    fb.mb_info[0] = MacroblockContext()
+    fill_bytes(&fb.intra_l[0], b_dc_pred, 4)

@@ -1,0 +1,124 @@
+#==============================================================================================
+#
+#   webp/vp8_transform - The inverse transforms
+#
+#   DESCRIPTION:
+#       Port of the transforms of dsp/dec.c (paragraph 14): the inverse DCT of a 4x4 block
+#       added to its prediction, its simplified forms for a block with only a DC or with
+#       only the first three coefficients, and the inverse Walsh-Hadamard transform of the
+#       luma DCs of a 16x16 macroblock.
+#
+#==============================================================================================
+
+## WEBP_TRANSFORM_AC3_MUL1: a * (1 + 20091 / 65536).
+inline func mul1(a: i32) -> i32:
+    return ((a * 20091) >> 16) + a
+
+## WEBP_TRANSFORM_AC3_MUL2: a * 35468 / 65536.
+inline func mul2(a: i32) -> i32:
+    return (a * 35468) >> 16
+
+## STORE: add `v` / 8 to the sample at (`x`, `y`), clipped.
+inline func store(dst: u8*, x: usize, y: usize, v: i32):
+    let p = dst + x + y * bps
+    p[0] = clip_255((i32)p[0] + (v >> 3))
+
+## TransformOne: the inverse DCT of the 16 coefficients at `input`, added to `dst`.
+func transform_one(input: const i16*, dst: u8*):
+    var tmp: i32[16] = ---
+    var src = input
+    for i in 0..<(usize)4:
+        # The vertical pass.
+        let a = (i32)src[0] + (i32)src[8]
+        let b = (i32)src[0] - (i32)src[8]
+        let c = mul2((i32)src[4]) - mul1((i32)src[12])
+        let d = mul1((i32)src[4]) + mul2((i32)src[12])
+        tmp[i * 4] = a + d
+        tmp[i * 4 + 1] = b + c
+        tmp[i * 4 + 2] = b - c
+        tmp[i * 4 + 3] = a - d
+        src = src + 1
+    var row = dst
+    for i in 0..<(usize)4:
+        # The horizontal pass.
+        let dc = tmp[i] + 4
+        let a = dc + tmp[i + 8]
+        let b = dc - tmp[i + 8]
+        let c = mul2(tmp[i + 4]) - mul1(tmp[i + 12])
+        let d = mul1(tmp[i + 4]) + mul2(tmp[i + 12])
+        store(row, 0, 0, a + d)
+        store(row, 1, 0, b + c)
+        store(row, 2, 0, b - c)
+        store(row, 3, 0, a - d)
+        row = row + bps
+
+## TransformAC3: the inverse DCT when only coefficients 0, 1 and 4 are non-zero.
+func transform_ac3(input: const i16*, dst: u8*):
+    let a = (i32)input[0] + 4
+    let c4 = mul2((i32)input[4])
+    let d4 = mul1((i32)input[4])
+    let c1 = mul2((i32)input[1])
+    let d1 = mul1((i32)input[1])
+    store2(dst, 0, a + d4, d1, c1)
+    store2(dst, 1, a + c4, d1, c1)
+    store2(dst, 2, a - c4, d1, c1)
+    store2(dst, 3, a - d4, d1, c1)
+
+## STORE2: one row of TransformAC3.
+inline func store2(dst: u8*, y: usize, dc: i32, d: i32, c: i32):
+    store(dst, 0, y, dc + d)
+    store(dst, 1, y, dc + c)
+    store(dst, 2, y, dc - c)
+    store(dst, 3, y, dc - d)
+
+## TransformDC: the inverse DCT of a block with only a DC.
+func transform_dc(input: const i16*, dst: u8*):
+    let dc = (i32)input[0] + 4
+    for j in 0..<(usize)4:
+        for i in 0..<(usize)4:
+            store(dst, i, j, dc)
+
+## TransformUV: the four blocks of an 8x8 chroma block, in full.
+func transform_uv(input: const i16*, dst: u8*):
+    transform_one(input, dst)
+    transform_one(input + 16, dst + 4)
+    transform_one(input + 32, dst + 4 * bps)
+    transform_one(input + 48, dst + 4 * bps + 4)
+
+## TransformDCUV: the four blocks of an 8x8 chroma block, each with only a DC.
+func transform_dc_uv(input: const i16*, dst: u8*):
+    if input[0] != 0:
+        transform_dc(input, dst)
+    if input[16] != 0:
+        transform_dc(input + 16, dst + 4)
+    if input[32] != 0:
+        transform_dc(input + 32, dst + 4 * bps)
+    if input[48] != 0:
+        transform_dc(input + 48, dst + 4 * bps + 4)
+
+## TransformWHT (paragraph 14.3): the 16 luma DCs at `input` into the DC of each of the
+## 16 blocks at `out`.
+func transform_wht(input: const i16*, out: i16*):
+    var tmp: i32[16] = ---
+    for i in 0..<(usize)4:
+        let a0 = (i32)input[i] + (i32)input[12 + i]
+        let a1 = (i32)input[4 + i] + (i32)input[8 + i]
+        let a2 = (i32)input[4 + i] - (i32)input[8 + i]
+        let a3 = (i32)input[i] - (i32)input[12 + i]
+        tmp[i] = a0 + a1
+        tmp[8 + i] = a0 - a1
+        tmp[4 + i] = a3 + a2
+        tmp[12 + i] = a3 - a2
+    var dst = out
+    for i in 0..<(usize)4:
+        # With the rounder.
+        let dc = tmp[i * 4] + 3
+        let a0 = dc + tmp[3 + i * 4]
+        let a1 = tmp[1 + i * 4] + tmp[2 + i * 4]
+        let a2 = tmp[1 + i * 4] - tmp[2 + i * 4]
+        let a3 = dc - tmp[3 + i * 4]
+        dst[0] = (i16)((a0 + a1) >> 3)
+        dst[16] = (i16)((a3 + a2) >> 3)
+        dst[32] = (i16)((a0 - a1) >> 3)
+        dst[48] = (i16)((a3 - a2) >> 3)
+        dst = dst + 64

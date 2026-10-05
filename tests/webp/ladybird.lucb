@@ -1,0 +1,165 @@
+#==============================================================================================
+#
+#   tests/webp/ladybird - Ladybird's WebP tests
+#
+#   DESCRIPTION:
+#       The WebP cases of Ladybird's Tests/LibGfx/TestImageDecoder.cpp (test_webp_*), on
+#       its test inputs (tests/fixtures/ladybird, BSD-2-Clause; 4.webp and
+#       4-with-8-partitions.webp are a Wikimedia photo under CC BY-SA 3.0). Ladybird decodes
+#       through libwebp, so these are libwebp's pixels; a picture without alpha is read
+#       opaque, as Ladybird's BGRx8888 bitmap reads it.
+#
+#==============================================================================================
+
+## Decode `name` and check its size and that it is a still picture (expect_single_frame).
+func single_frame(name: str, width: usize, height: usize) -> Decoded!:
+    let decoded = try decode_fixture(name)
+    assert(decoded.found.width == width and decoded.found.height == height)
+    assert(not decoded.found.animated and decoded.found.frame_count == 1 and decoded.found.plays() == 1)
+    return decoded
+
+test "test_webp_simple_lossy":
+    var decoded = try single_frame("ladybird/simple-vp8.webp", 240, 240)
+    defer decoded.release()
+    assert(decoded.found.format == Format.lossy)
+    assert(decoded.pixel(120, 232) == 0xf1eff0ff)
+    assert(decoded.pixel(198, 202) == 0x7aaad5ff)
+
+test "test_webp_simple_lossless":
+    # The predictor, color and subtract green transforms, meta prefix images, one-element
+    # canonical codes, and codes of more than 288 elements; every predictor mode.
+    var decoded = try single_frame("ladybird/simple-vp8l.webp", 386, 395)
+    defer decoded.release()
+    assert(decoded.found.format == Format.lossless)
+    assert(decoded.pixel(0, 0) == 0x00000000)
+    assert(decoded.pixel(289, 332) == 0xf2eed3ff)
+
+test "test_webp_simple_lossless_alpha_used_false":
+    # The same file with the alpha-used bit clear: still decoded with its alpha, which is
+    # not used.
+    var decoded = try single_frame("ladybird/simple-vp8l-alpha-used-false.webp", 386, 395)
+    defer decoded.release()
+    assert(not decoded.found.alpha)
+    assert(decoded.pixel(0, 0) == 0x000000ff)
+
+test "test_webp_extended_lossy":
+    # Lossy, with a losslessly compressed ALPH chunk.
+    var decoded = try single_frame("ladybird/extended-lossy.webp", 417, 223)
+    defer decoded.release()
+    assert(decoded.pixel(89, 72) == 0xff0100ff)
+    assert(decoded.pixel(174, 69) == 0x00ff00ff)
+    assert(decoded.pixel(245, 84) == 0x0000ffff)
+    assert(decoded.pixel(352, 125) == 0x00000080)
+    assert(decoded.pixel(355, 106) == 0x00000000)
+    # The lossy version's transparent top left is white, the lossless one's black.
+    assert(decoded.pixel(0, 0) == 0xffffff00)
+    assert(decoded.pixel(43, 75) == 0xff0002ff)
+    assert(decoded.pixel(141, 75) == 0x00ff03ff)
+    assert(decoded.pixel(235, 75) == 0x0000ffff)
+    assert(decoded.pixel(341, 75) == 0x00000080)
+
+test "test_webp_extended_lossy_alpha_horizontal_filter":
+    var decoded = try single_frame("ladybird/smolkling-horizontal-alpha.webp", 264, 264)
+    defer decoded.release()
+    assert(decoded.pixel(131, 131) == 0x8f50334b)
+
+test "test_webp_extended_lossy_alpha_vertical_filter":
+    var decoded = try single_frame("ladybird/smolkling-vertical-alpha.webp", 264, 264)
+    defer decoded.release()
+    assert(decoded.pixel(131, 131) == 0x9250324c)
+
+test "test_webp_extended_lossy_alpha_gradient_filter":
+    # The center is opaque, not transparent.
+    var decoded = try single_frame("ladybird/smolkling-gradient-alpha.webp", 264, 264)
+    defer decoded.release()
+    assert(decoded.pixel(131, 131) == 0x8a482eff)
+
+test "test_webp_extended_lossy_uncompressed_alpha":
+    var decoded = try single_frame("ladybird/extended-lossy-uncompressed-alpha.webp", 417, 223)
+    defer decoded.release()
+    assert(decoded.pixel(89, 72) == 0xfe0006ff)
+    assert(decoded.pixel(174, 69) == 0x00ff00ff)
+    assert(decoded.pixel(245, 84) == 0x0000ffff)
+    assert(decoded.pixel(352, 125) == 0x00000080)
+    assert(decoded.pixel(355, 106) == 0x00000000)
+
+test "test_webp_extended_lossy_negative_quantization_offset":
+    var decoded = try single_frame("ladybird/smolkling.webp", 264, 264)
+    defer decoded.release()
+    assert(decoded.pixel(16, 16) == 0x3b2518ff)
+
+test "test_webp_lossy_4":
+    # Macroblocks with skip_coefficients set, and a boolean decoder edge case.
+    var decoded = try single_frame("ladybird/4.webp", 1024, 772)
+    defer decoded.release()
+    assert(decoded.pixel(780, 570) == 0x72c8f6ff)
+
+test "test_webp_lossy_4_with_partitions":
+    # The same picture with 8 token partitions.
+    var decoded = try single_frame("ladybird/4-with-8-partitions.webp", 1024, 772)
+    defer decoded.release()
+    assert(decoded.pixel(780, 570) == 0x72c7f8ff)
+
+test "test_webp_extended_lossless":
+    var decoded = try single_frame("ladybird/extended-lossless.webp", 417, 223)
+    defer decoded.release()
+    assert(decoded.pixel(0, 0) == 0x00000000)
+    assert(decoded.pixel(43, 75) == 0xff0000ff)
+    assert(decoded.pixel(141, 75) == 0x00ff00ff)
+    assert(decoded.pixel(235, 75) == 0x0000ffff)
+    assert(decoded.pixel(341, 75) == 0x00000080)
+    # Pixels from the color cache.
+    assert(decoded.pixel(94, 73) == 0xff0000ff)
+    assert(decoded.pixel(176, 115) == 0x00ff00ff)
+    assert(decoded.pixel(290, 89) == 0x0000ffff)
+    assert(decoded.pixel(359, 73) == 0x00000080)
+
+test "test_webp_simple_lossless_color_index_transform":
+    # The color indexing transform, and a code's explicit max_symbol.
+    var decoded = try single_frame("ladybird/Qpalette.webp", 256, 256)
+    defer decoded.release()
+    assert(decoded.pixel(100, 100) == 0x733723ff)
+
+## A catdog-alert case: the line and background colors at five points.
+func catdog(name: str, line: u32, background: u32) -> !:
+    var decoded = try single_frame(name, 32, 32)
+    defer decoded.release()
+    assert(decoded.pixel(4, 0) == background and decoded.pixel(5, 0) == line)
+    assert(decoded.pixel(9, 5) == background and decoded.pixel(10, 5) == line and decoded.pixel(11, 5) == background)
+
+test "test_webp_simple_lossless_color_index_transform_pixel_bundling":
+    # 1, 2 and 4 bits a pixel; alpha-used false reads the palette's alpha as opaque.
+    try catdog("ladybird/catdog-alert-2.webp", 0x35120aff, 0xf3e6d8ff)
+    try catdog("ladybird/catdog-alert-3.webp", 0x35120aff, 0x00000000)
+    try catdog("ladybird/catdog-alert-8.webp", 0x000000ff, 0x00000000)
+    try catdog("ladybird/catdog-alert-13.webp", 0x000000ff, 0x00000000)
+    try catdog("ladybird/catdog-alert-13-alpha-used-false.webp", 0x000000ff, 0x000000ff)
+
+test "test_webp_simple_lossless_color_index_transform_pixel_bundling_odd_width":
+    for name in ["ladybird/width11-height11-colors2.webp", "ladybird/width11-height11-colors3.webp", "ladybird/width11-height11-colors15.webp"]:
+        var decoded = try single_frame(name, 11, 11)
+        decoded.release()
+
+test "test_webp_extended_lossless_animated":
+    let data = try fixture("ladybird/extended-lossless-animated.webp")
+    defer free(data) in memory.heap
+    let found = try info(data)
+    assert(found.loop_count == 42 and found.frame_count == 8 and found.animated)
+    assert(found.width == 990 and found.height == 1050)
+    var animation = try Animation.open(data)
+    defer animation.release()
+    let pixels = try new u8[990 * 1050 * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    for index in 0..<animation.frames().length:
+        try animation.render(index, pixels)
+        let frame = Decoded(found = found, pixels = pixels)
+        # The same color in every frame.
+        assert(frame.pixel(500, 700) == 0xffff00ff)
+        # Not the same in every frame.
+        assert(frame.pixel(500, 0) == (0x000000ff if index == 2 or index == 6 else 0x00000000))
+
+test "test_webp_unpremultiplied_alpha":
+    # Straight alpha: color channels may exceed alpha.
+    var decoded = try single_frame("ladybird/semi-transparent-pixel.webp", 1, 1)
+    defer decoded.release()
+    assert(decoded.pixel(0, 0) == 0xffffff80)

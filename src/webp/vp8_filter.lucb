@@ -1,0 +1,250 @@
+#==============================================================================================
+#
+#   webp/vp8_filter - The loop filters and their strengths
+#
+#   DESCRIPTION:
+#       Port of the edge filters of dsp/dec.c (paragraph 15: the simple filter, on luma
+#       only, and the complex filter, on luma and chroma, each on a macroblock's left and
+#       top edges and on its three inner edges each way), and of frame_dec.c's DoFilter
+#       and PrecomputeFilterStrengths. Each filter reads up to four samples on each side
+#       of an edge at `p`, `step` apart across it, and the filtered edges follow one
+#       another `stride` apart along it. libwebp's clipping tables become the clamps they
+#       hold.
+#
+#==============================================================================================
+
+# mark: Clamps ================================================================================
+
+## VP8ksclip1: `v` clamped to -128..127.
+inline func sclip1(v: i32) -> i32:
+    return -128 if v < -128 else 127 if v > 127 else v
+
+## VP8ksclip2: `v` clamped to -16..15.
+inline func sclip2(v: i32) -> i32:
+    return -16 if v < -16 else 15 if v > 15 else v
+
+## VP8kabs0.
+inline func abs0(v: i32) -> i32:
+    return -v if v < 0 else v
+
+# mark: Edges =================================================================================
+
+## DoFilter2: four samples in, the two at the edge out.
+inline func do_filter2(p: u8*, step: usize):
+    let p1 = (i32)(p - 2 * step)[0]
+    let p0 = (i32)(p - step)[0]
+    let q0 = (i32)p[0]
+    let q1 = (i32)p[step]
+    let a = 3 * (q0 - p0) + sclip1(p1 - q1)
+    let a1 = sclip2((a + 4) >> 3)
+    let a2 = sclip2((a + 3) >> 3)
+    (p - step)[0] = clip_255(p0 + a2)
+    p[0] = clip_255(q0 - a1)
+
+## DoFilter4: four samples in, four out.
+inline func do_filter4(p: u8*, step: usize):
+    let p1 = (i32)(p - 2 * step)[0]
+    let p0 = (i32)(p - step)[0]
+    let q0 = (i32)p[0]
+    let q1 = (i32)p[step]
+    let a = 3 * (q0 - p0)
+    let a1 = sclip2((a + 4) >> 3)
+    let a2 = sclip2((a + 3) >> 3)
+    let a3 = (a1 + 1) >> 1
+    (p - 2 * step)[0] = clip_255(p1 + a3)
+    (p - step)[0] = clip_255(p0 + a2)
+    p[0] = clip_255(q0 - a1)
+    p[step] = clip_255(q1 - a3)
+
+## DoFilter6: six samples in, six out.
+inline func do_filter6(p: u8*, step: usize):
+    let p2 = (i32)(p - 3 * step)[0]
+    let p1 = (i32)(p - 2 * step)[0]
+    let p0 = (i32)(p - step)[0]
+    let q0 = (i32)p[0]
+    let q1 = (i32)p[step]
+    let q2 = (i32)p[2 * step]
+    let a = sclip1(3 * (q0 - p0) + sclip1(p1 - q1))
+    # a is in [-128,127], a1 in [-27,27], a2 in [-18,18] and a3 in [-9,9].
+    let a1 = (27 * a + 63) >> 7
+    let a2 = (18 * a + 63) >> 7
+    let a3 = (9 * a + 63) >> 7
+    (p - 3 * step)[0] = clip_255(p2 + a3)
+    (p - 2 * step)[0] = clip_255(p1 + a2)
+    (p - step)[0] = clip_255(p0 + a1)
+    p[0] = clip_255(q0 - a1)
+    p[step] = clip_255(q1 - a2)
+    p[2 * step] = clip_255(q2 - a3)
+
+## Hev: whether the edge has high variance.
+inline func hev(p: const u8*, step: usize, thresh: i32) -> bool:
+    let p1 = (i32)(p - 2 * step)[0]
+    let p0 = (i32)(p - step)[0]
+    let q0 = (i32)p[0]
+    let q1 = (i32)p[step]
+    return abs0(p1 - p0) > thresh or abs0(q1 - q0) > thresh
+
+## NeedsFilter: whether the simple filter applies.
+inline func needs_filter(p: const u8*, step: usize, t: i32) -> bool:
+    let p1 = (i32)(p - 2 * step)[0]
+    let p0 = (i32)(p - step)[0]
+    let q0 = (i32)p[0]
+    let q1 = (i32)p[step]
+    return 4 * abs0(p0 - q0) + abs0(p1 - q1) <= t
+
+## NeedsFilter2: whether the complex filter applies.
+inline func needs_filter2(p: const u8*, step: usize, t: i32, it: i32) -> bool:
+    let p3 = (i32)(p - 4 * step)[0]
+    let p2 = (i32)(p - 3 * step)[0]
+    let p1 = (i32)(p - 2 * step)[0]
+    let p0 = (i32)(p - step)[0]
+    let q0 = (i32)p[0]
+    let q1 = (i32)p[step]
+    let q2 = (i32)p[2 * step]
+    let q3 = (i32)p[3 * step]
+    if 4 * abs0(p0 - q0) + abs0(p1 - q1) > t:
+        return false
+    return abs0(p3 - p2) <= it and abs0(p2 - p1) <= it and abs0(p1 - p0) <= it and abs0(q3 - q2) <= it and abs0(q2 - q1) <= it and abs0(q1 - q0) <= it
+
+# mark: Simple filter =========================================================================
+
+## SimpleVFilter16: the horizontal edge above `p`, 16 samples wide.
+func simple_v_filter16(p: u8*, stride: usize, thresh: i32):
+    let thresh2 = 2 * thresh + 1
+    for i in 0..<(usize)16:
+        if needs_filter(p + i, stride, thresh2):
+            do_filter2(p + i, stride)
+
+## SimpleHFilter16: the vertical edge left of `p`, 16 samples high.
+func simple_h_filter16(p: u8*, stride: usize, thresh: i32):
+    let thresh2 = 2 * thresh + 1
+    for i in 0..<(usize)16:
+        if needs_filter(p + i * stride, 1, thresh2):
+            do_filter2(p + i * stride, 1)
+
+## SimpleVFilter16i: the three inner horizontal edges.
+func simple_v_filter16i(p: u8*, stride: usize, thresh: i32):
+    for k in 1..<(usize)4:
+        simple_v_filter16(p + 4 * k * stride, stride, thresh)
+
+## SimpleHFilter16i: the three inner vertical edges.
+func simple_h_filter16i(p: u8*, stride: usize, thresh: i32):
+    for k in 1..<(usize)4:
+        simple_h_filter16(p + 4 * k, stride, thresh)
+
+# mark: Complex filter ========================================================================
+
+## FilterLoop26: a macroblock edge, `size` samples along it.
+func filter_loop26(p: u8*, hstride: usize, vstride: usize, size: usize, thresh: i32, ithresh: i32, hev_thresh: i32):
+    let thresh2 = 2 * thresh + 1
+    var at = p
+    for i in 0..<size:
+        if needs_filter2(at, hstride, thresh2, ithresh):
+            if hev(at, hstride, hev_thresh):
+                do_filter2(at, hstride)
+            else:
+                do_filter6(at, hstride)
+        at = at + vstride
+
+## FilterLoop24: an inner edge, `size` samples along it.
+func filter_loop24(p: u8*, hstride: usize, vstride: usize, size: usize, thresh: i32, ithresh: i32, hev_thresh: i32):
+    let thresh2 = 2 * thresh + 1
+    var at = p
+    for i in 0..<size:
+        if needs_filter2(at, hstride, thresh2, ithresh):
+            if hev(at, hstride, hev_thresh):
+                do_filter2(at, hstride)
+            else:
+                do_filter4(at, hstride)
+        at = at + vstride
+
+# mark: Macroblocks ===========================================================================
+
+## DoFilter: the edges of macroblock (`mb_x`, `mb_y`) in the row cache.
+func filter_macroblock(dec: const Vp8*, fb: FrameBuffers*, mb_x: usize, mb_y: usize):
+    let y_bps = fb.cache_y_stride
+    let strength = fb.f_info[mb_x]
+    let y_dst = fb.cache_y + mb_x * 16
+    let ilevel = (i32)strength.ilevel
+    let edge_limit = (i32)strength.limit
+    if edge_limit == 0:
+        return
+    if dec.filter_type == 1:
+        # The simple filter.
+        if mb_x > 0:
+            simple_h_filter16(y_dst, y_bps, edge_limit + 4)
+        if strength.inner:
+            simple_h_filter16i(y_dst, y_bps, edge_limit)
+        if mb_y > 0:
+            simple_v_filter16(y_dst, y_bps, edge_limit + 4)
+        if strength.inner:
+            simple_v_filter16i(y_dst, y_bps, edge_limit)
+        return
+    # The complex filter.
+    let uv_bps = fb.cache_uv_stride
+    let u_dst = fb.cache_u + mb_x * 8
+    let v_dst = fb.cache_v + mb_x * 8
+    let hev_thresh = (i32)strength.hev_thresh
+    if mb_x > 0:
+        filter_loop26(y_dst, 1, y_bps, 16, edge_limit + 4, ilevel, hev_thresh)
+        filter_loop26(u_dst, 1, uv_bps, 8, edge_limit + 4, ilevel, hev_thresh)
+        filter_loop26(v_dst, 1, uv_bps, 8, edge_limit + 4, ilevel, hev_thresh)
+    if strength.inner:
+        for k in 1..<(usize)4:
+            filter_loop24(y_dst + 4 * k, 1, y_bps, 16, edge_limit, ilevel, hev_thresh)
+        filter_loop24(u_dst + 4, 1, uv_bps, 8, edge_limit, ilevel, hev_thresh)
+        filter_loop24(v_dst + 4, 1, uv_bps, 8, edge_limit, ilevel, hev_thresh)
+    if mb_y > 0:
+        filter_loop26(y_dst, y_bps, 1, 16, edge_limit + 4, ilevel, hev_thresh)
+        filter_loop26(u_dst, uv_bps, 1, 8, edge_limit + 4, ilevel, hev_thresh)
+        filter_loop26(v_dst, uv_bps, 1, 8, edge_limit + 4, ilevel, hev_thresh)
+    if strength.inner:
+        for k in 1..<(usize)4:
+            filter_loop24(y_dst + 4 * k * y_bps, y_bps, 1, 16, edge_limit, ilevel, hev_thresh)
+        filter_loop24(u_dst + 4 * uv_bps, uv_bps, 1, 8, edge_limit, ilevel, hev_thresh)
+        filter_loop24(v_dst + 4 * uv_bps, uv_bps, 1, 8, edge_limit, ilevel, hev_thresh)
+
+## FilterRow: the edges of the decoded macroblock row.
+func filter_macroblock_row(dec: const Vp8*, fb: FrameBuffers*, mb_y: usize):
+    for mb_x in dec.tl_mb_x..<dec.br_mb_x:
+        filter_macroblock(dec, fb, mb_x, mb_y)
+
+## PrecomputeFilterStrengths: each segment's strengths, for 16x16 and 4x4 macroblocks
+## (`fstrengths[segment * 2 + is_i4x4]`).
+func precompute_filter_strengths(dec: Vp8*):
+    if dec.filter_type == 0:
+        return
+    let hdr = &dec.filter_hdr
+    for s in 0..<num_mb_segments:
+        # The initial level.
+        var base_level: i32 = 0
+        if dec.segment_hdr.use_segment:
+            base_level = dec.segment_hdr.filter_strength[s]
+            if not dec.segment_hdr.absolute_delta:
+                base_level += hdr.level
+        else:
+            base_level = hdr.level
+        for i4x4 in 0..<(usize)2:
+            var strength = FilterInfo()
+            var level = base_level
+            if hdr.use_lf_delta:
+                level += hdr.ref_lf_delta[0]
+                if i4x4 == 1:
+                    level += hdr.mode_lf_delta[0]
+            level = 0 if level < 0 else 63 if level > 63 else level
+            if level > 0:
+                var ilevel = level
+                if hdr.sharpness > 0:
+                    if hdr.sharpness > 4:
+                        ilevel >>= 2
+                    else:
+                        ilevel >>= 1
+                    if ilevel > 9 - hdr.sharpness:
+                        ilevel = 9 - hdr.sharpness
+                if ilevel < 1:
+                    ilevel = 1
+                strength.ilevel = (u8)ilevel
+                strength.limit = (u8)(2 * level + ilevel)
+                strength.hev_thresh = 2 if level >= 40 else 1 if level >= 15 else 0
+            strength.inner = i4x4 == 1
+            dec.fstrengths[s * 2 + i4x4] = strength

@@ -1,0 +1,10 @@
+#prisma 4.0
+def package "luce-webp" {
+    str owner = "dymokomi"
+    str version = "0.1.0"
+    str kind = "package"
+    str language = "luce-base"
+    str description = "A WebP decoder for Luce/Base: a faithful port of libwebp 1.6.0, lossy, lossless, alpha and animation, bit for bit libwebp's output."
+    str readme = "README.md"
+    str[] public = ["webp"]
+}

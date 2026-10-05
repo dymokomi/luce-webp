@@ -1,0 +1,129 @@
+#==============================================================================================
+#
+#   tools/webpcheck - Decode WebP files as Ladybird asks libwebp to, and report them
+#
+#   DESCRIPTION:
+#       The Luce half of the oracle comparison (tests/run.py, against the C oracle
+#       luce-browser-tools/oracles/luce-webp/webp_oracle.c, whose output it matches line
+#       for line). For each file it reads the features, for an animation opens it, reads
+#       the ICC profile as WebPMux does, and prints
+#
+#           PATH ok WIDTH HEIGHT ALPHA ANIMATED FRAMES LOOP BGCOLOR ICC
+#           frame INDEX DURATION HASH        (or: frame INDEX error)
+#
+#       or `PATH error STAGE`, ICC being `-` or `SIZE:HASH`, HASH the 64-bit FNV-1a of the
+#       frame's straight RGBA (the whole canvas of an animation). `-o DIR` also writes
+#       frame N of the Kth file to DIR/K-N.rgba. `--bench COUNT PATH` decodes a still
+#       picture COUNT times and prints the best time in milliseconds.
+#
+#       Usage: webpcheck [-o DIR] FILE...  |  webpcheck --bench COUNT FILE
+#
+#==============================================================================================
+
+import io
+import memory
+import strings
+import time
+import webp
+import disk
+
+extern func fflush(file: void*?) -> i32
+
+## The 64-bit FNV-1a hash of `data`.
+func fnv(data: const u8[]) -> u64:
+    var hash: u64 = 14695981039346656037
+    for byte in data:
+        hash ^= (u64)byte
+        hash = hash *% 1099511628211
+    return hash
+
+## Write `pixels` as frame `frame` of file `file` into `directory`, when there is one.
+func write_frame(directory: str?, file: usize, frame: usize, pixels: const u8[]) -> !:
+    let into = directory else return
+    var name: u8[64]
+    let tail = try strings.format(name, f"/{file}-{frame}.rgba")
+    var path = disk.Buffer()
+    defer path.release()
+    try path.add_all(into.bytes)
+    try path.add_all(tail.bytes)
+    try disk.write_file((str)path.view(), pixels)
+
+## Report one file: the steps of Ladybird's decode_webp_header, then its frames.
+func run(path: str, file: usize, directory: str?) -> !:
+    let out = io.stdout()
+    let data = disk.read_file(path) else return print(f"{path} error read")
+    defer free(data) in memory.heap
+    var found = webp.features(data) catch:
+        print(f"{path} error info")
+        return
+    if found.animated:
+        var animation = webp.Animation.open(data) catch:
+            print(f"{path} error anim")
+            return
+        defer animation.release()
+        found = animation.info
+        try report_header(path, found, data)
+        let pixels = try new u8[found.width * found.height * 4] in memory.heap
+        defer free(pixels) in memory.heap
+        for (index, frame) in animation.frames().indexed():
+            animation.render(index, pixels) catch:
+                print(f"frame {index} error")
+                break
+            print(f"frame {index} {frame.duration} {fnv(pixels):016x}")
+            try write_frame(directory, file, index, pixels)
+        return
+    try report_header(path, found, data)
+    let pixels = try new u8[found.width * found.height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    webp.decode_rgba8(data, pixels) catch:
+        print("frame 0 error")
+        return
+    print(f"frame 0 0 {fnv(pixels):016x}")
+    try write_frame(directory, file, 0, pixels)
+
+## The ICC profile as WebPMux reads it, then the header line.
+func report_header(path: str, found: webp.Info, data: const u8[]) -> !:
+    let out = io.stdout()
+    let profile = webp.icc_profile(data) catch:
+        print(f"{path} error mux")
+        error(webp.corrupt, "the mux refuses the file")
+    _ = try out.write(f"{path} ok {found.width} {found.height} {1 if found.alpha else 0} {1 if found.animated else 0} {found.frame_count} {found.loop_count} {found.background:08x} ")
+    if let bytes = profile:
+        _ = try out.write(f"{bytes.length}:{fnv(bytes):016x}\n")
+    else:
+        _ = try out.write("-\n")
+
+## Decode the still picture at `path` `count` times; print the best time.
+func bench(count: usize, path: str) -> !:
+    let data = disk.read_file(path) else error(webp.invalid, "cannot read the file")
+    defer free(data) in memory.heap
+    let found = try webp.info(data)
+    let pixels = try new u8[found.width * found.height * 4] --- in memory.heap
+    defer free(pixels) in memory.heap
+    var best: u64 = 0xffffffffffffffff
+    for i in 0..<count:
+        let start = time.now()
+        try webp.decode_rgba8(data, pixels)
+        let took = time.since(start)
+        if took < best:
+            best = took
+    print(f"{path} {found.width}x{found.height} best {f64(best) / 1000000.0:.3f} ms")
+
+pub func main(arguments: str[]) -> i32!:
+    if arguments.length >= 4 and arguments[1] == "--bench":
+        var count: usize = 0
+        for digit in arguments[2].bytes:
+            count = count * 10 + (usize)(digit - '0')
+        try bench(count, arguments[3])
+        return 0
+    var directory: str? = none
+    var first: usize = 1
+    if arguments.length >= 3 and arguments[1] == "-o":
+        directory = arguments[2]
+        first = 3
+    for index in first..<arguments.length:
+        run(arguments[index], index - first, directory) catch failure:
+            if failure.code != webp.corrupt:
+                print(f"{arguments[index]} failed {failure.message}")
+        _ = fflush(none)
+    return 0

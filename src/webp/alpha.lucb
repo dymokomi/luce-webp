@@ -1,0 +1,120 @@
+#==============================================================================================
+#
+#   webp/alpha - The ALPH chunk
+#
+#   DESCRIPTION:
+#       Port of dec/alpha_dec.c and dsp/filters.c's unfilters. A lossy picture's alpha
+#       plane is an ALPH chunk: a header byte (compression method, filter, pre-processing,
+#       reserved bits), then the plane, raw or as a VP8L image stream whose green channel
+#       holds it. The filter predicts each sample from its left, top or both (gradient)
+#       neighbours, and the plane holds the differences. libwebp decodes the plane a few
+#       rows ahead of the color rows; this decodes it whole at the first request, which
+#       gives the same plane and fails where libwebp's decode fails. Pre-processing (level
+#       quantization) only matters to alpha dithering, which is off.
+#
+#==============================================================================================
+
+## The ALPH header byte's values (format_constants.h).
+let alpha_header_len: usize = 1
+let alpha_no_compression: u8 = 0
+let alpha_lossless_compression: u8 = 1
+let alpha_preprocessed_levels: u8 = 1
+
+## The alpha filters (WEBP_FILTER_TYPE).
+let filter_none: u8 = 0
+let filter_horizontal: u8 = 1
+let filter_vertical: u8 = 2
+let filter_gradient: u8 = 3
+
+## A lossy picture's alpha plane: the ALPH chunk's payload and, once decoded, the plane.
+struct Alpha:
+    ## Whether the picture has an ALPH chunk (even an empty one).
+    var present: bool
+    var data: const u8[]
+    var width: usize
+    var height: usize
+    var plane: u8[]
+    var decoded: bool
+
+    ## The alpha of a `width` by `height` picture from the ALPH payload `data`, if any.
+    static func of(present: bool, data: const u8[], width: usize, height: usize) -> Alpha:
+        return Alpha(present = present, data = data, width = width, height = height)
+
+    func release():
+        if self.plane.length > 0:
+            free(self.plane) in memory.heap
+        var empty: u8[]
+        self.plane = empty
+
+    ## VP8DecompressAlphaRows: plane row `row`, with `num_rows` rows decoded from it on.
+    func rows(row: usize, num_rows: usize) -> const u8*!:
+        if num_rows == 0 or row + num_rows > self.height:
+            error(corrupt, "WebP alpha rows are out of range")
+        if not self.decoded:
+            self.plane = try new u8[self.width * self.height] --- in memory.heap
+            try self.decode()
+            self.decoded = true
+        return self.plane.data + row * self.width
+
+    ## ALPHInit and ALPHDecode: the whole plane.
+    func decode() -> !:
+        let data = self.data
+        if data.length <= alpha_header_len:
+            error(corrupt, "WebP alpha data is too short")
+        let method = data[0] & 0x03
+        let filter = (data[0] >> 2) & 0x03
+        let pre_processing = (data[0] >> 4) & 0x03
+        let rsrv = (data[0] >> 6) & 0x03
+        if method > alpha_lossless_compression or pre_processing > alpha_preprocessed_levels or rsrv != 0:
+            error(corrupt, "WebP alpha header is invalid")
+        let alpha_data = data[alpha_header_len..]
+        if method == alpha_no_compression:
+            if alpha_data.length < self.width * self.height:
+                error(corrupt, "WebP raw alpha data is too short")
+            var prev_line: const u8*? = none
+            for y in 0..<self.height:
+                let dst = self.plane.data + y * self.width
+                unfilter(filter, prev_line, alpha_data.data + y * self.width, dst, self.width)
+                prev_line = dst
+            return
+        try decode_alpha_lossless(alpha_data, self.width, self.height, filter, self.plane)
+
+# mark: Unfilters =============================================================================
+
+## GradientPredictor: left + top - top left, clipped.
+inline func gradient_predictor(a: u8, b: u8, c: u8) -> u8:
+    let g = (i32)a + (i32)b - (i32)c
+    return (u8)g if (g & ~0xff) == 0 else 0 if g < 0 else 255
+
+## WebPUnfilters[filter]: the row `input`, of differences from its prediction by `prev`
+## (the row above, none for the first), into `out`; `out` may be `input`.
+func unfilter(filter: u8, prev: const u8*?, input: const u8*, out: u8*, width: usize):
+    if filter == filter_none:
+        if (const u8*)out != input:
+            copy_bytes(out, input, width)
+        return
+    let above = prev else return horizontal_unfilter(none, input, out, width)
+    if filter == filter_horizontal:
+        horizontal_unfilter(above, input, out, width)
+    elif filter == filter_vertical:
+        for i in 0..<width:
+            out[i] = above[i] +% input[i]
+    else:
+        var top = above[0]
+        var top_left = top
+        var left = top
+        for i in 0..<width:
+            # Read first, in case `prev` is `out`.
+            top = above[i]
+            left = input[i] +% gradient_predictor(left, top, top_left)
+            top_left = top
+            out[i] = left
+
+## HorizontalUnfilter: each sample from its left neighbour, the first from the one above.
+func horizontal_unfilter(prev: const u8*?, input: const u8*, out: u8*, width: usize):
+    var pred: u8 = 0
+    if let above = prev:
+        pred = above[0]
+    for i in 0..<width:
+        out[i] = pred +% input[i]
+        pred = out[i]

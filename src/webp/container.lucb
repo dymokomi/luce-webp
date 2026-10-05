@@ -1,0 +1,335 @@
+#==============================================================================================
+#
+#   webp/container - The RIFF container: headers and features
+#
+#   DESCRIPTION:
+#       Port of dec/webp_dec.c's header parsing. A WebP is a RIFF container ("RIFF",
+#       size, "WEBP") holding a VP8 or VP8L chunk (simple format), or a VP8X chunk with
+#       its flags and canvas size, optional chunks (ALPH, ICCP, ANIM, ANMF, EXIF, XMP,
+#       unknown ones) and then the VP8 or VP8L chunk (extended format). Without a RIFF
+#       header the bytes may be a bare VP8 or VP8L bitstream, or ALPH then VP8: the
+#       payload of an animation frame, which WebPAnimDecoder decodes that way.
+#
+#       `parse_headers` is ParseHeadersInternal: it validates the chunks up to the
+#       picture's bitstream, finds the ALPH chunk, and reads the picture's size from the
+#       VP8 or VP8L header. Its statuses keep libwebp's distinction between a damaged file
+#       and one that ends early, which decides what WebPGetFeatures accepts.
+#
+#==============================================================================================
+
+# mark: Constants =============================================================================
+
+let tag_size: usize = 4
+let chunk_header_size: usize = 8
+let riff_header_size: usize = 12
+let vp8x_chunk_size: usize = 10
+## The largest chunk payload a RIFF size can describe (MAX_CHUNK_PAYLOAD).
+let max_chunk_payload: u64 = 4294967286
+## Canvases of 2^32 pixels or more are refused (MAX_IMAGE_AREA).
+let max_image_area: u64 = 4294967296
+## The VP8X flags (mux_types.h).
+let animation_flag: u32 = 0x00000002
+let xmp_flag: u32 = 0x00000004
+let exif_flag: u32 = 0x00000008
+let alpha_flag: u32 = 0x00000010
+let iccp_flag: u32 = 0x00000020
+let all_valid_flags: u32 = 0x0000003E
+## Bytes of a VP8 frame header (3 bytes of tag, 7 of key frame header) and a VP8L header.
+let vp8_frame_header_size: usize = 10
+let vp8l_frame_header_size: usize = 5
+let vp8l_magic_byte: u8 = 0x2f
+
+## The outcome of a parsing step (VP8StatusCode, the codes the parser gives).
+enum Status:
+    ok
+    not_enough_data
+    bitstream_error
+    unsupported_feature
+
+# mark: Reading ===============================================================================
+
+## The little-endian 16-bit number at `at` of `data`.
+func le16(data: const u8[], at: usize) -> u32:
+    return (u32)data[at] | ((u32)data[at + 1] << 8)
+
+## The little-endian 24-bit number at `at` of `data`.
+func le24(data: const u8[], at: usize) -> u32:
+    return le16(data, at) | ((u32)data[at + 2] << 16)
+
+## The little-endian 32-bit number at `at` of `data`.
+func le32(data: const u8[], at: usize) -> u32:
+    return le16(data, at) | (le16(data, at + 2) << 16)
+
+## Whether the four bytes of `data` at `at` are `tag`; false when `data` ends first.
+func holds(data: const u8[], at: usize, tag: str) -> bool:
+    if at + tag.length > data.length:
+        return false
+    return (str)data[at..<at + tag.length] == tag
+
+# mark: Headers ===============================================================================
+
+## What WebPGetFeatures reports, and where the picture's bitstream is (WebPHeaderStructure).
+struct Headers:
+    var width: usize
+    var height: usize
+    var alpha: bool
+    var animated: bool
+    var format: Format = Format.mixed
+    ## The RIFF size, 0 without a RIFF header.
+    var riff_size: usize
+    ## The ALPH chunk's payload: whether there is one, where it starts and its size.
+    var alpha_found: bool
+    var alpha_offset: usize
+    var alpha_size: usize
+    ## The VP8 or VP8L bitstream: where it starts and the size its chunk gives.
+    var offset: usize
+    var compressed_size: usize
+    var lossless: bool
+
+## A parse position in `data`: the bytes left start at `at`.
+struct Cursor:
+    var data: const u8[]
+    var at: usize
+
+    func left() -> usize:
+        return self.data.length - self.at
+
+## ParseRIFF: skip a valid RIFF header, giving its size (0 when there is none).
+func parse_riff(cursor: Cursor*, have_all_data: bool, riff_size: usize*) -> Status:
+    *riff_size = 0
+    if cursor.left() >= riff_header_size and holds(cursor.data, cursor.at, "RIFF"):
+        if not holds(cursor.data, cursor.at + 8, "WEBP"):
+            return Status.bitstream_error
+        let size = (u64)le32(cursor.data, cursor.at + tag_size)
+        # At least one chunk ("WEBP" + "VP8?nnnn").
+        if size < (u64)(tag_size + chunk_header_size):
+            return Status.bitstream_error
+        if size > max_chunk_payload:
+            return Status.bitstream_error
+        if have_all_data and size > (u64)(cursor.left() - chunk_header_size):
+            return Status.not_enough_data
+        *riff_size = (usize)size
+        cursor.at += riff_header_size
+    return Status.ok
+
+## ParseVP8X: skip a valid VP8X chunk, giving its canvas size and flags.
+func parse_vp8x(cursor: Cursor*, found: bool*, width: usize*, height: usize*, flags: u32*) -> Status:
+    *found = false
+    if cursor.left() < chunk_header_size:
+        return Status.not_enough_data
+    if holds(cursor.data, cursor.at, "VP8X"):
+        if (usize)le32(cursor.data, cursor.at + tag_size) != vp8x_chunk_size:
+            return Status.bitstream_error
+        if cursor.left() < chunk_header_size + vp8x_chunk_size:
+            return Status.not_enough_data
+        let w = 1 + (u64)le24(cursor.data, cursor.at + 12)
+        let h = 1 + (u64)le24(cursor.data, cursor.at + 15)
+        if w * h >= max_image_area:
+            return Status.bitstream_error
+        *flags = le32(cursor.data, cursor.at + 8)
+        *width = (usize)w
+        *height = (usize)h
+        cursor.at += chunk_header_size + vp8x_chunk_size
+        *found = true
+    return Status.ok
+
+## ParseOptionalChunks: skip the chunks before the VP8 or VP8L chunk, noting the ALPH
+## chunk's payload.
+func parse_optional_chunks(cursor: Cursor*, riff_size: usize, headers: Headers*) -> Status:
+    var buf = cursor.at
+    # "WEBP" + "VP8Xnnnn" + its data.
+    var total_size = (u32)(tag_size + chunk_header_size + vp8x_chunk_size)
+    headers.alpha_found = false
+    while true:
+        cursor.at = buf
+        let buf_size = cursor.data.length - buf
+        if buf_size < chunk_header_size:
+            return Status.not_enough_data
+        let chunk_size = le32(cursor.data, buf + tag_size)
+        if (u64)chunk_size > max_chunk_payload:
+            return Status.bitstream_error
+        # An odd-sized payload is padded with one byte.
+        let disk_chunk_size = ((u32)chunk_header_size +% chunk_size +% 1) & ~(u32)1
+        total_size = total_size +% disk_chunk_size
+        if riff_size > 0 and (usize)total_size > riff_size:
+            return Status.bitstream_error
+        # A (possibly incomplete) VP8 or VP8L chunk ends the optional chunks.
+        if holds(cursor.data, buf, "VP8 ") or holds(cursor.data, buf, "VP8L"):
+            return Status.ok
+        if buf_size < (usize)disk_chunk_size:
+            return Status.not_enough_data
+        if holds(cursor.data, buf, "ALPH"):
+            headers.alpha_found = true
+            headers.alpha_offset = buf + chunk_header_size
+            headers.alpha_size = (usize)chunk_size
+        buf += (usize)disk_chunk_size
+
+## ParseVP8Header: skip the VP8 or VP8L chunk header, giving the bitstream's size; bytes
+## with no such header are a raw VP8 or VP8L bitstream.
+func parse_vp8_header(cursor: Cursor*, have_all_data: bool, riff_size: usize, chunk_size: usize*, lossless: bool*) -> Status:
+    let is_vp8 = holds(cursor.data, cursor.at, "VP8 ")
+    let is_vp8l = holds(cursor.data, cursor.at, "VP8L")
+    let minimal_size = tag_size + chunk_header_size
+    if cursor.left() < chunk_header_size:
+        return Status.not_enough_data
+    if is_vp8 or is_vp8l:
+        let size = (usize)le32(cursor.data, cursor.at + tag_size)
+        if riff_size >= minimal_size and size > riff_size - minimal_size:
+            return Status.bitstream_error
+        if have_all_data and size > cursor.left() - chunk_header_size:
+            return Status.not_enough_data
+        *chunk_size = size
+        cursor.at += chunk_header_size
+        *lossless = is_vp8l
+    else:
+        *lossless = vp8l_check_signature(cursor.data[cursor.at..])
+        *chunk_size = cursor.left()
+    return Status.ok
+
+## ParseHeadersInternal. `full` asks for the bitstream's position too (WebPParseHeaders,
+## for decoding); without it an animation's VP8X chunk is enough. `have_all_data` makes a
+## chunk running past the end an error.
+func parse_headers(data: const u8[], full: bool, have_all_data: bool, headers: Headers*) -> Status:
+    *headers = Headers()
+    if data.length < riff_header_size:
+        return Status.not_enough_data
+    var cursor = Cursor(data = data, at = 0)
+    var status = parse_riff(&cursor, have_all_data, &headers.riff_size)
+    if status != Status.ok:
+        return status
+    let found_riff = headers.riff_size > 0
+    var found_vp8x = false
+    var canvas_width: usize = 0
+    var canvas_height: usize = 0
+    var flags: u32 = 0
+    status = parse_vp8x(&cursor, &found_vp8x, &canvas_width, &canvas_height, &flags)
+    if status != Status.ok:
+        return status
+    let animation_present = (flags & animation_flag) != 0
+    if not found_riff and found_vp8x:
+        return Status.bitstream_error
+    headers.alpha = (flags & alpha_flag) != 0
+    headers.animated = animation_present
+    headers.width = canvas_width
+    headers.height = canvas_height
+    if found_vp8x and animation_present and not full:
+        return Status.ok
+    status = parse_picture_headers(&cursor, found_riff, found_vp8x, have_all_data, headers)
+    if status == Status.bitstream_error or status == Status.unsupported_feature:
+        return status
+    if status == Status.ok and found_vp8x and (canvas_width != headers.width or canvas_height != headers.height):
+        return Status.bitstream_error
+    headers.offset = cursor.at
+    if status == Status.ok or (status == Status.not_enough_data and found_vp8x and not full):
+        # Without a VP8X or VP8L chunk, an ALPH chunk is the only sign of alpha.
+        headers.alpha = headers.alpha or headers.alpha_found
+        if status != Status.ok:
+            headers.width = canvas_width
+            headers.height = canvas_height
+        return Status.ok
+    return status
+
+## The part of ParseHeadersInternal after the VP8X chunk: the optional chunks and the
+## picture's own header, giving its size in `headers`.
+func parse_picture_headers(cursor: Cursor*, found_riff: bool, found_vp8x: bool, have_all_data: bool, headers: Headers*) -> Status:
+    if cursor.left() < tag_size:
+        return Status.not_enough_data
+    if (found_riff and found_vp8x) or (not found_riff and not found_vp8x and holds(cursor.data, cursor.at, "ALPH")):
+        let status = parse_optional_chunks(cursor, headers.riff_size, headers)
+        if status != Status.ok:
+            return status
+    let status = parse_vp8_header(cursor, have_all_data, headers.riff_size, &headers.compressed_size, &headers.lossless)
+    if status != Status.ok:
+        return status
+    if (u64)headers.compressed_size > max_chunk_payload:
+        return Status.bitstream_error
+    if not headers.animated:
+        headers.format = Format.lossless if headers.lossless else Format.lossy
+    let bitstream = cursor.data[cursor.at..]
+    if not headers.lossless:
+        if bitstream.length < vp8_frame_header_size:
+            return Status.not_enough_data
+        let size = vp8_get_info(bitstream, headers.compressed_size) else return Status.bitstream_error
+        headers.width = size.0
+        headers.height = size.1
+    else:
+        if bitstream.length < vp8l_frame_header_size:
+            return Status.not_enough_data
+        let header = vp8l_get_info(bitstream) else return Status.bitstream_error
+        headers.width = header.width
+        headers.height = header.height
+        headers.alpha = header.alpha
+    return Status.ok
+
+## WebPGetFeatures: the canvas, alpha, animation flag and format of the WebP in `data`,
+## read from its headers alone (an animation's frames are not walked: `info` does that).
+## Fails as WebPGetInfo fails.
+pub func features(data: const u8[]) -> Info!:
+    var headers: Headers = ---
+    let status = parse_headers(data, false, false, &headers)
+    if status != Status.ok:
+        try fail_with(status, "WebP header")
+    return Info(width = headers.width, height = headers.height, alpha = headers.alpha, animated = headers.animated, format = headers.format)
+
+## Fail with the error code of `status`.
+func fail_with(status: Status, what: str) -> !:
+    match status:
+        .ok:
+            return
+        .not_enough_data:
+            error(corrupt, "WebP data ends early")
+        .bitstream_error:
+            error(corrupt, "WebP bitstream is damaged")
+        .unsupported_feature:
+            error(unsupported, "WebP uses a feature this decoder refuses")
+
+# mark: Bitstream headers =====================================================================
+
+## VP8CheckSignature: the key frame start code.
+func vp8_check_signature(data: const u8[]) -> bool:
+    return data.length >= 3 and data[0] == 0x9d and data[1] == 0x01 and data[2] == 0x2a
+
+## VP8GetInfo: the size of a VP8 key frame, or none when its frame header is not one a
+## decoder shows.
+func vp8_get_info(data: const u8[], chunk_size: usize) -> (usize, usize)?:
+    if data.length < vp8_frame_header_size or not vp8_check_signature(data[3..]):
+        return none
+    let bits = (u32)data[0] | ((u32)data[1] << 8) | ((u32)data[2] << 16)
+    let key_frame = (bits & 1) == 0
+    let w = (((usize)data[7] << 8) | (usize)data[6]) & 0x3fff
+    let h = (((usize)data[9] << 8) | (usize)data[8]) & 0x3fff
+    # Not a key frame, an unknown profile, an invisible frame, an inconsistent partition
+    # size, or no pixels.
+    if not key_frame or ((bits >> 1) & 7) > 3 or ((bits >> 4) & 1) == 0 or (usize)(bits >> 5) >= chunk_size or w == 0 or h == 0:
+        return none
+    return (w, h)
+
+## VP8LCheckSignature: the lossless signature byte and version 0.
+func vp8l_check_signature(data: const u8[]) -> bool:
+    return data.length >= vp8l_frame_header_size and data[0] == vp8l_magic_byte and (data[4] >> 5) == 0
+
+## The size and alpha bit of a VP8L header.
+struct LosslessHeader:
+    var width: usize
+    var height: usize
+    var alpha: bool
+
+## VP8LGetInfo: a VP8L header, or none when it is not valid.
+func vp8l_get_info(data: const u8[]) -> LosslessHeader?:
+    if data.length < vp8l_frame_header_size or not vp8l_check_signature(data):
+        return none
+    var br = LosslessBits.start(data)
+    return read_image_info(&br)
+
+## ReadImageInfo: the VP8L header's fields, none when they are not valid.
+func read_image_info(br: LosslessBits*) -> LosslessHeader?:
+    if br.read_bits(8) != (u32)vp8l_magic_byte:
+        return none
+    let width = (usize)br.read_bits(14) + 1
+    let height = (usize)br.read_bits(14) + 1
+    let alpha = br.read_bits(1) != 0
+    if br.read_bits(3) != 0:
+        return none
+    if br.eos:
+        return none
+    return LosslessHeader(width = width, height = height, alpha = alpha)

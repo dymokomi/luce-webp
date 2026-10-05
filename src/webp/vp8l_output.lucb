@@ -1,0 +1,234 @@
+#==============================================================================================
+#
+#   webp/vp8l_output - Lossless rows out: RGBA, and alpha planes
+#
+#   DESCRIPTION:
+#       Port of the row processing of dec/vp8l_dec.c (ProcessRows, ApplyInverseTransforms,
+#       EmitRows, ExtractAlphaRows, ExtractPalettedAlphaRows, AlphaApplyFilter), of the
+#       byte-per-pixel alpha decoder (DecodeAlphaData), and of the entry points:
+#       VP8LDecodeHeader with VP8LDecodeImage for a VP8L picture, and
+#       VP8LDecodeAlphaHeader with VP8LDecodeAlphaImageStream for an ALPH chunk.
+#
+#==============================================================================================
+
+# mark: Rows ==================================================================================
+
+## ApplyInverseTransforms: rows `start_row` to `start_row + num_rows` of `rows` through the
+## transforms, last read first, into the cache.
+func apply_inverse_transforms(dec: Lossless*, start_row: usize, num_rows: usize, rows: const u32*):
+    let end_row = start_row + num_rows
+    var rows_in = rows
+    let rows_out = dec.pixels.data + dec.argb_cache
+    var n = dec.next_transform
+    while n > 0:
+        n -= 1
+        inverse_transform(&dec.transforms[n], start_row, end_row, rows_in, rows_out)
+        rows_in = rows_out
+    if rows_in != (const u32*)rows_out:
+        # No transform: a copy.
+        let count = dec.width * num_rows
+        memory.copy(u32[](rows_out, count), u32[]((u32*)rows_in, count), count)
+
+## The rows decoded since the last call, up to `row`, handed to the sink.
+func process_rows(dec: Lossless*, row: usize) -> !:
+    match dec.sink:
+        .keep:
+            return
+        .rgba:
+            process_rgba_rows(dec, row)
+        .alpha:
+            extract_alpha_rows(dec, row)
+
+## ProcessRows with EmitRows: transformed and converted to RGBA.
+func process_rgba_rows(dec: Lossless*, row: usize):
+    let num_rows = row - dec.last_row
+    if num_rows > 0:
+        let rows = dec.pixels.data + dec.width * dec.last_row
+        apply_inverse_transforms(dec, dec.last_row, num_rows, rows)
+        var y_end = row
+        if y_end > dec.io_height:
+            y_end = dec.io_height
+        if dec.last_row < y_end:
+            let cache = dec.pixels.data + dec.argb_cache
+            for y in 0..<y_end - dec.last_row:
+                let out = dec.area_pixels.data + (dec.last_out_row + y) * dec.area_stride
+                convert_to_rgba(cache + y * dec.io_width, dec.io_width, out)
+            dec.last_out_row += y_end - dec.last_row
+    dec.last_row = row
+
+## AlphaApplyFilter: the alpha rows `first_row` to `last_row` at `out` unfiltered in place.
+func alpha_apply_filter(dec: Lossless*, first_row: usize, last_row: usize, out: u8*, stride: usize):
+    if dec.filter == filter_none:
+        return
+    var prev: const u8*? = none
+    if let at = dec.prev_line:
+        prev = dec.plane.data + at
+    var row = out
+    for y in first_row..<last_row:
+        unfilter(dec.filter, prev, row, row, stride)
+        prev = row
+        row = row + stride
+    if let last = prev:
+        dec.prev_line = (usize)(last - (const u8*)dec.plane.data)
+
+## ExtractAlphaRows: the transformed rows' green as alpha, sixteen rows at a time.
+func extract_alpha_rows(dec: Lossless*, last_row: usize):
+    var cur_row = dec.last_row
+    var num_rows = last_row - cur_row
+    var input = dec.pixels.data + dec.width * cur_row
+    let width = dec.io_width
+    while num_rows > 0:
+        let num_rows_to_process = num_argb_cache_rows if num_rows > num_argb_cache_rows else num_rows
+        let dst = dec.plane.data + width * cur_row
+        apply_inverse_transforms(dec, cur_row, num_rows_to_process, input)
+        # WebPExtractGreen.
+        let src = dec.pixels.data + dec.argb_cache
+        for i in 0..<width * num_rows_to_process:
+            dst[i] = (u8)(src[i] >> 8)
+        alpha_apply_filter(dec, cur_row, cur_row + num_rows_to_process, dst, width)
+        num_rows -= num_rows_to_process
+        input = input + num_rows_to_process * dec.width
+        cur_row += num_rows_to_process
+    dec.last_row = last_row
+    dec.last_out_row = last_row
+
+## AllocateInternalBuffers32b: the pixels, the row above the cache, and the cache.
+func allocate_internal_buffers32(dec: Lossless*, final_width: usize) -> !:
+    let num_pixels = dec.width * dec.height
+    let cache_top_pixels = final_width
+    let cache_pixels = final_width * num_argb_cache_rows
+    dec.pixels = try new u32[num_pixels + cache_top_pixels + cache_pixels] --- in memory.heap
+    dec.argb_cache = num_pixels + cache_top_pixels
+
+# mark: Entry points ==========================================================================
+
+## VP8LDecodeHeader and VP8LDecodeImage: the VP8L bitstream `data` into `area`.
+func decode_vp8l(data: const u8[], area: Area) -> !:
+    var dec = Lossless(br = LosslessBits.start(data))
+    defer dec.release()
+    let header = read_image_info(&dec.br) else error(corrupt, "VP8L header is invalid")
+    dec.io_width = header.width
+    dec.io_height = header.height
+    _ = try decode_image_stream(&dec, header.width, header.height, true)
+    try check_area(area, header.width, header.height)
+    try allocate_internal_buffers32(&dec, header.width)
+    dec.sink = Sink.rgba
+    dec.area_pixels = u8[](area.pixels, area.size)
+    dec.area_stride = area.stride
+    try decode_image_data(&dec, dec.pixels.data, dec.width, dec.height, dec.io_height)
+
+## VP8LDecodeAlphaHeader and VP8LDecodeAlphaImageStream: the lossless alpha stream `data`
+## of a `width` by `height` plane, unfiltered by `filter`, into `plane`.
+func decode_alpha_lossless(data: const u8[], width: usize, height: usize, filter: u8, plane: u8[]) -> !:
+    var dec = Lossless(br = LosslessBits.start(data), width = width, height = height, io_width = width, io_height = height, plane = plane, filter = filter)
+    defer dec.release()
+    _ = try decode_image_stream(&dec, width, height, true)
+    # Palette-only alpha without a color cache (the usual case) decodes a byte a pixel.
+    if dec.next_transform == 1 and dec.transforms[0].kind == color_indexing_transform and is_8b_optimizable(&dec.hdr):
+        let pixels = try new u8[dec.width * dec.height] --- in memory.heap
+        defer free(pixels) in memory.heap
+        try decode_alpha_data(&dec, pixels, height)
+        return
+    try allocate_internal_buffers32(&dec, width)
+    dec.sink = Sink.alpha
+    try decode_image_data(&dec, dec.pixels.data, dec.width, dec.height, height)
+
+## Is8bOptimizable: no color cache, and one red, blue and alpha symbol in every group.
+func is_8b_optimizable(hdr: const Metadata*) -> bool:
+    if hdr.color_cache_size > 0:
+        return false
+    let codes = hdr.huffman_tables.codes
+    for i in 0..<hdr.num_htree_groups:
+        let htrees = hdr.htree_groups[i].htrees
+        if codes[htrees[huff_red]].bits > 0 or codes[htrees[huff_blue]].bits > 0 or codes[htrees[huff_alpha]].bits > 0:
+            return false
+    return true
+
+## ExtractPalettedAlphaRows: the palette indices of the rows decoded since the last call
+## to alpha, unfiltered.
+func extract_paletted_alpha_rows(dec: Lossless*, data: const u8[], last_row: usize):
+    let first_row = dec.last_row
+    if last_row > first_row:
+        let width = dec.io_width
+        let out = dec.plane.data + width * first_row
+        let input = data.data + dec.width * first_row
+        color_index_inverse_transform_alpha(&dec.transforms[0], first_row, last_row, input, out)
+        alpha_apply_filter(dec, first_row, last_row, out, width)
+    dec.last_row = last_row
+    dec.last_out_row = last_row
+
+## CopyBlock8b: `length` bytes from `dist` back, overlapping as a repeating pattern.
+inline func copy_block8(dst: u8*, dist: usize, length: usize):
+    let src = dst - dist
+    if dist >= length:
+        copy_bytes(dst, src, length)
+        return
+    for i in 0..<length:
+        dst[i] = src[i]
+
+## DecodeAlphaData: the palette indices of an alpha stream into `data`, a byte a pixel,
+## up to row `last_row`.
+func decode_alpha_data(dec: Lossless*, data: u8[], last_row: usize) -> !:
+    let width = dec.width
+    let height = dec.height
+    var row = dec.last_pixel // width
+    var col = dec.last_pixel % width
+    let br = &dec.br
+    let hdr = &dec.hdr
+    var pos = dec.last_pixel
+    let end = width * height
+    let last = width * last_row
+    let len_code_limit = num_literal_codes + num_length_codes
+    let mask = hdr.huffman_mask
+    let codes = hdr.huffman_tables.codes.data
+    var group: const TreeGroup* = &hdr.htree_groups[0]
+    if pos < last:
+        group = group_for_pos(hdr, col, row)
+    var ok = true
+    while not br.eos and pos < last:
+        # Only when the tile changes.
+        if (col & mask) == 0:
+            group = group_for_pos(hdr, col, row)
+        br.fill_bit_window()
+        let code = read_symbol(codes + group.htrees[huff_green], br)
+        if code < num_literal_codes:
+            data[pos] = (u8)code
+            pos += 1
+            col += 1
+            if col >= width:
+                col = 0
+                row += 1
+                if row <= last_row and row % num_argb_cache_rows == 0:
+                    extract_paletted_alpha_rows(dec, data, row)
+        elif code < len_code_limit:
+            # A backward reference.
+            let length = get_copy_distance(code - num_literal_codes, br)
+            let dist_symbol = read_symbol(codes + group.htrees[huff_dist], br)
+            br.fill_bit_window()
+            let dist_code = get_copy_distance(dist_symbol, br)
+            let distance = plane_code_to_distance(width, dist_code)
+            if pos >= distance and end - pos >= length:
+                copy_block8(data.data + pos, distance, length)
+            else:
+                ok = false
+                break
+            pos += length
+            col += length
+            while col >= width:
+                col -= width
+                row += 1
+                if row <= last_row and row % num_argb_cache_rows == 0:
+                    extract_paletted_alpha_rows(dec, data, row)
+            if pos < last and (col & mask) != 0:
+                group = group_for_pos(hdr, col, row)
+        else:
+            ok = false
+            break
+        br.eos = br.is_end_of_stream()
+    if ok:
+        # The rows of the last batch.
+        extract_paletted_alpha_rows(dec, data, row if row < last_row else last_row)
+    br.eos = br.is_end_of_stream()
+    if not ok or (br.eos and pos < end):
+        error(corrupt, "VP8L alpha data is damaged or ends early")
+    dec.last_pixel = pos
