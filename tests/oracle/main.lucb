@@ -1,0 +1,18 @@
+#==============================================================================================
+#
+#   tests/oracle - luce-webp against libwebp
+#
+#   DESCRIPTION:
+#       Runs gate.py beside this file (see its description): tools/webpcheck built native,
+#       C and diagnostic, compared line for line with libwebp's output on the fixtures, and
+#       damaged fixtures decoded without a trap. The package has no luce-std, so the C
+#       library's `system` starts it; its output goes straight to ours.
+#
+#==============================================================================================
+
+import c
+
+extern func system(command: c.str) -> i32
+
+pub func main(arguments: str[]) -> i32:
+    return 0 if system("python3 tests/oracle/gate.py") == 0 else 1

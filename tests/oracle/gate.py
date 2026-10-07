@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
-"""luce-webp's gate, with every compiler named: LUCE_BASE (by default the luce-base checkout
-beside this package), then each of LUCE_BASE_EXTRA (colon-separated). For each:
+"""luce-webp's decoder against libwebp, run by tests/oracle/main.lucb (`luc test`, which runs
+the module's test blocks itself):
 
-- `check -W` of the module and `fmt --check` of every source;
-- the module's tests (tests/webp, Ladybird's TestImageDecoder cases and more), native and C;
 - tools/webpcheck built native, C and with the diagnostic profile (which fills `---`
-  storage with 0xaa), each run over tests/fixtures (Ladybird's WebP test inputs and files
-  made with libwebp's own encoders, damaged ones among them) and compared line for line with
-  tests/fixtures/expected.txt: libwebp 1.6.0's features, frame durations and FNV-1a hashes
-  of every frame, from the C oracle in luce-browser-tools/oracles/luce-webp
-  (`tests/run.py --expected ORACLE` writes it again);
+  storage with 0xaa) into build/tests/oracle, each run over tests/fixtures (Ladybird's WebP
+  test inputs and files made with libwebp's own encoders, damaged ones among them) and
+  compared line for line with tests/fixtures/expected.txt: libwebp 1.6.0's features, frame
+  durations and FNV-1a hashes of every frame, from the C oracle in
+  luce-browser-tools/oracles/luce-webp (`tests/oracle/gate.py --expected ORACLE` writes it
+  again);
 - every third fixture cut short at many lengths and with flipped bytes, decoded without a trap or
   a hang.
 """
 import os, random, subprocess, sys, tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-FIRST = Path(os.environ.get("LUCE_BASE") or ROOT.parent / "luce-base/build/luce-base").resolve()
-EXTRA = [Path(p).resolve() for p in os.environ.get("LUCE_BASE_EXTRA", "").split(":") if p]
-SOURCES = sorted(str(p.relative_to(ROOT)) for p in ROOT.glob("*/**/*.lucb") if p.parts[len(ROOT.parts)] in ("src", "tests", "tools"))
+ROOT = Path(__file__).resolve().parents[2]
+BASE = os.environ.get("LUCE_BASE", "luce-base")
+BUILD = ROOT / "build/tests/oracle"
 FIXTURES = ROOT / "tests/fixtures"
 NAMES = sorted(str(p.relative_to(FIXTURES)) for p in FIXTURES.glob("*/*.webp"))
 EXPECTED = [line for line in (FIXTURES / "expected.txt").read_text().splitlines() if not line.startswith("#")]
@@ -77,20 +75,11 @@ if len(sys.argv) == 3 and sys.argv[1] == "--expected":
     (FIXTURES / "expected.txt").write_text("# libwebp 1.6.0's portable C build on these files (luce-browser-tools/oracles/luce-webp, webp_oracle_scalar)\n" + lines)
     sys.exit(0)
 
-for base in [FIRST, *EXTRA]:
-    warnings = run(base, "check", "src/webp", "-W")
-    if warnings.strip():
-        sys.exit(f"FAIL: {base} check -W src/webp:\n{warnings}")
-    for source in SOURCES:
-        run(base, "fmt", source, "--check")
-    for flags in (["--native"], ["--backend=c"]):
-        out = run(base, "test", "src/webp", *flags)
-        print(f"{base}: webp {' '.join(flags)}: {out.strip().splitlines()[-1]}")
-    (ROOT / "build").mkdir(exist_ok=True)
-    for flags, label in ((["--native"], "native"), (["--backend=c"], "C"), (["--profile", "diagnostic"], "diagnostic")):
-        tool = ROOT / f"build/webpcheck-{label}"
-        run(base, "build", "tools/webpcheck.lucb", *flags, "-o", tool)
-        check_fixtures(tool, f"webpcheck ({label})")
-        if label == "native":
-            check_damage(tool, f"webpcheck ({label})")
-print("PASS luce-webp: decoder, fixtures and tools")
+BUILD.mkdir(parents=True, exist_ok=True)
+for flags, label in ((["--native"], "native"), (["--backend=c"], "C"), (["--profile", "diagnostic"], "diagnostic")):
+    tool = BUILD / f"webpcheck-{label}"
+    run(BASE, "build", "tools/webpcheck.lucb", *flags, "-o", tool)
+    check_fixtures(tool, f"webpcheck ({label})")
+    if label == "native":
+        check_damage(tool, f"webpcheck ({label})")
+print("PASS luce-webp: fixtures against libwebp")

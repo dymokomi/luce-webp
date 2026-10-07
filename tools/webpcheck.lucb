@@ -3,7 +3,7 @@
 #   tools/webpcheck - Decode WebP files as Ladybird asks libwebp to, and report them
 #
 #   DESCRIPTION:
-#       The Luce half of the oracle comparison (tests/run.py, against the C oracle
+#       The Luce half of the oracle comparison (tests/oracle/gate.py, against the C oracle
 #       luce-browser-tools/oracles/luce-webp/webp_oracle.c, whose output it matches line
 #       for line). For each file it reads the features, for an animation opens it, reads
 #       the ICC profile as WebPMux does, and prints

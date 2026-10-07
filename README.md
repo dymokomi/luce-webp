@@ -71,7 +71,7 @@ and fails where libwebp fails.
 
 ## Agreement with libwebp
 
-`tests/run.py` compares every frame of tests/fixtures (Ladybird's 23 WebP test inputs and 83
+`luc test` (its program `tests/oracle`) compares every frame of tests/fixtures (Ladybird's 23 WebP test inputs and 83
 files made with libwebp 1.6.0's cwebp, img2webp, gif2webp and webpmux, damaged ones among
 them) with libwebp's output, through the C oracle in luce-browser-tools
 (`oracles/luce-webp`): features, durations and an FNV-1a hash of every frame, in native, C
@@ -102,9 +102,9 @@ On a 1024x772 picture (Apple M-series, native build), against libwebp built with
 ## Tests
 
 ```
-./test.sh                                   # every compiler named: -W, fmt, tests, fixtures
-LUCE_BASE_EXTRA=~/.local/bin/luce-base ./test.sh
-python3 tests/run.py --expected ORACLE      # expected.txt again, from libwebp
+luc test                                       # the module's tests, then tests/oracle: the fixtures against libwebp
+tools/check.sh                                 # lint: -W and fmt
+python3 tests/oracle/gate.py --expected ORACLE # expected.txt again, from libwebp
 ```
 
 ## Licenses
